@@ -159,6 +159,24 @@ impl LandlockSandbox {
             ),
             // some variant of sh requires access to /dev/null
             ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+            // DNS resolution: glibc's resolver (used by getaddrinfo, and thus by
+            // Python/most language runtimes) reads these to resolve hostnames.
+            // All are optional: not every distro/config uses all of them, and a
+            // missing rule here must not turn into a startup failure.
+            ("/etc/resolv.conf", AccessFs::ReadFile.into(), false),
+            ("/etc/nsswitch.conf", AccessFs::ReadFile.into(), false),
+            ("/etc/hosts", AccessFs::ReadFile.into(), false),
+            ("/etc/gai.conf", AccessFs::ReadFile.into(), false),
+            // systemd-resolved: /etc/resolv.conf is commonly a symlink into this
+            // directory, and glibc's nss-resolve module connects to the
+            // `io.systemd.Resolve` varlink socket here. WriteFile is required
+            // because Landlock treats AF_UNIX connect() like a file open with
+            // read+write access rights.
+            (
+                "/run/systemd/resolve",
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+                false,
+            ),
         ] {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {
