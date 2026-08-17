@@ -177,6 +177,43 @@ impl LandlockSandbox {
                 AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
                 false,
             ),
+            // TLS trust store: OpenSSL/GnuTLS read the CA bundle from here to
+            // verify certificates. Without a rule, any HTTPS request from a
+            // sandboxed child fails with "unable to get local issuer
+            // certificate" even though the socket itself connects fine.
+            //
+            // These are deliberately the certificate subpaths rather than
+            // `/etc/ssl` as a whole: `PathBeneath` is recursive, and `/etc/ssl`
+            // also contains `private/`, the conventional home for server private
+            // keys. Landlock only ever restricts — it cannot grant access DAC
+            // already denies — but there is no reason to hand the sandbox a rule
+            // covering key material it never needs.
+            //
+            // Both the link and its target must be covered: Landlock authorizes
+            // the *resolved* path, and on Arch-family systems the entries under
+            // `/etc/ssl` are symlinks into `/etc/ca-certificates/extracted`
+            // (`/etc/ssl/cert.pem` -> `../ca-certificates/extracted/tls-ca-bundle.pem`),
+            // so a rule covering only the link would authorize nothing. `/etc/pki`
+            // is the RHEL/Fedora layout. Debian's `/usr/share/ca-certificates`
+            // already falls under the `/usr` rule above.
+            //
+            // ReadDir is required alongside ReadFile because OpenSSL's hashed
+            // `capath` lookup (`/etc/ssl/certs`) enumerates the directory.
+            (
+                "/etc/ssl/certs",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            ("/etc/ssl/cert.pem", AccessFs::ReadFile.into(), false),
+            // OpenSSL reads its config at library init; without a rule it falls
+            // back to built-in defaults, which can change verification behaviour.
+            ("/etc/ssl/openssl.cnf", AccessFs::ReadFile.into(), false),
+            (
+                "/etc/ca-certificates",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            ("/etc/pki", AccessFs::ReadFile | AccessFs::ReadDir, false),
         ] {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {
