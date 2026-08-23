@@ -154,7 +154,7 @@ fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 10] {
 }
 
 /// Rights an overlapping rule leaks into a tier root, i.e. the rights the tier
-/// deliberately withholds that some other rule grants anyway.
+/// deliberately withholds that the other rule grants anyway.
 ///
 /// Landlock rules are **additive within a layer**: for a given file the kernel
 /// takes the union of the rights of every rule whose subtree contains it. A
@@ -163,6 +163,13 @@ fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 10] {
 /// `ReadFile | WriteFile | Truncate` recursively for every child, so a
 /// read-only root beneath `/tmp` would still be writable, and a write-only
 /// root beneath it would still be readable, no matter what its own rule says.
+///
+/// **Only ever applied against [`generic_rules`].** Overlap between
+/// policy-derived grants — the workspace and the three tiers — is not a
+/// conflict but the composition `SecurityPolicy` itself performs, and the
+/// kernel's union reproduces it exactly. Feeding those grants in here would
+/// make two nested restrictive tiers cancel each other out and deny both
+/// rights. See the call site in `build_ruleset`.
 ///
 /// The test is symmetric on containment because both rules are `PathBeneath`
 /// (recursive): whichever of the two is the ancestor, the union applies
@@ -280,72 +287,69 @@ impl LandlockSandbox {
             ),
         ];
 
-        // Every recursive grant this ruleset will contain, resolved to the path
-        // the kernel actually sees. A tier root has to be checked against all of
-        // them — including the other tiers — because Landlock unions the rights
-        // of overlapping rules (see `leaked_rights`).
+        // The rules the *policy layer* never authorized: the static allow-list
+        // this backend installs so a child can find its loader, its libraries,
+        // and a temp directory. `SecurityPolicy` knows nothing about them — it
+        // lists `/tmp` among the broad `forbidden_paths` — so these are the only
+        // rules that can grant a tier root rights the policy withholds.
         //
-        // `canonicalize` doubles as the "will this rule be installed at all?"
-        // test: it fails for exactly the absent paths that are skipped below, so
-        // a rule that is never added cannot manufacture a false conflict. Its
-        // symlink resolution also means overlap is decided on real paths rather
-        // than on however config happened to spell them. A path that exists but
-        // cannot be canonicalized (no search permission on a parent) is simply
-        // left out of the comparison; the rule is still installed, so this errs
-        // toward the pre-existing behaviour rather than toward silent skipping.
-        let mut grants: Vec<(PathBuf, BitFlags<AccessFs>)> = Vec::new();
-        if let Some(ref workspace) = self.workspace_dir
-            && let Ok(resolved) = workspace.canonicalize()
-        {
-            grants.push((resolved, read_write_access()));
-        }
-        for (path, perm, _) in generic_rules() {
-            if let Ok(resolved) = Path::new(path).canonicalize() {
-                grants.push((resolved, perm));
-            }
-        }
+        // Resolved once here, and only when the path exists: `canonicalize`
+        // fails for exactly the paths whose rules are skipped below, so a rule
+        // that is never installed cannot manufacture a false conflict. Its
+        // symlink resolution also means overlap is decided on the paths the
+        // kernel sees rather than on however they happened to be spelled. A path
+        // that exists but cannot be canonicalized (no search permission on a
+        // parent) is simply left out of the comparison; its rule is still
+        // installed, so this errs toward the pre-existing behaviour rather than
+        // toward silent skipping.
+        let generic_grants: Vec<(PathBuf, BitFlags<AccessFs>)> = generic_rules()
+            .into_iter()
+            .filter_map(|(path, perm, _)| {
+                Path::new(path)
+                    .canonicalize()
+                    .ok()
+                    .map(|resolved| (resolved, perm))
+            })
+            .collect();
 
-        // Tier roots carry the index they occupy in `grants` so each one can be
-        // compared against every *other* grant without matching itself.
-        let mut tier_roots: Vec<(&'static str, &PathBuf, BitFlags<AccessFs>, Option<usize>)> =
-            Vec::new();
+        // Overlap *between* policy-derived grants is not a conflict: it is how
+        // the policy composes. `SecurityPolicy` resolves a path by consulting
+        // the workspace, then the read-write tier, then — for reads — the
+        // read-only tier and — for writes — the write-only tier, taking the
+        // first grant that matches. A write-only root nested inside a read-only
+        // root is therefore readable *and* writable at the application layer
+        // (`is_resolved_path_readable` matches the read-only parent;
+        // `is_resolved_path_allowed` matches the write-only child), and the same
+        // holds for the reverse nesting and for a path listed in both tiers.
+        //
+        // Landlock unions the rights of every rule covering a path, so simply
+        // installing both rules reproduces that composition exactly. Treating
+        // the two as undercutting each other would deny both rights and leave a
+        // valid configuration with no kernel access at all.
         for (tier, roots, perm) in tiers {
             for root in roots {
-                let index = match root.canonicalize() {
-                    Ok(resolved) => {
-                        grants.push((resolved, perm));
-                        Some(grants.len() - 1)
-                    }
-                    Err(_) => None,
-                };
-                tier_roots.push((tier, root, perm, index));
-            }
-        }
-
-        for (tier, root, perm, index) in tier_roots {
-            // A tier whose rights are undercut by an overlapping rule is not
-            // enforceable, and installing its rule anyway would advertise a
-            // boundary the kernel does not implement: the read-only root would
-            // still be writable, the write-only root still readable. Skip the
-            // rule and say so at WARN.
-            //
-            // Skipping is not a loss of protection — the path keeps exactly the
-            // rights the overlapping rule already gave it, which is what it had
-            // before any tier was propagated — but it is the difference between
-            // a boundary that is absent and one that is falsely advertised. The
-            // fix belongs in configuration: move the root out from under the
-            // broader rule (`/tmp`, the workspace, a read-write root) and the
-            // tier becomes enforceable again.
-            if let Some(index) = index {
-                let leaked = grants
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != index)
-                    .find_map(|(_, (grant_path, grant_perm))| {
-                        let leaked = leaked_rights(&grants[index].0, perm, grant_path, *grant_perm);
-                        (!leaked.is_empty()).then_some((grant_path.clone(), leaked))
-                    });
-                if let Some((grant_path, leaked)) = leaked {
+                // A tier whose rights are undercut by a *generic* rule is not
+                // enforceable: Landlock rules are additive within a layer, so a
+                // rule can never subtract a right that an overlapping rule
+                // already granted. Installing it anyway would advertise a
+                // boundary the kernel does not implement — the read-only root
+                // beneath `/tmp` would still be writable, the write-only root
+                // still readable. Skip the rule and say so at WARN.
+                //
+                // Skipping is not a loss of protection — the path keeps exactly
+                // the rights the generic rule already gave it, which is what it
+                // had before any tier was propagated — but it is the difference
+                // between a boundary that is absent and one that is falsely
+                // advertised. The fix belongs in configuration: move the root
+                // out from under the generic rule and the tier becomes
+                // enforceable again.
+                if let Ok(resolved) = root.canonicalize()
+                    && let Some((grant_path, leaked)) =
+                        generic_grants.iter().find_map(|(grant_path, grant_perm)| {
+                            let leaked = leaked_rights(&resolved, perm, grant_path, *grant_perm);
+                            (!leaked.is_empty()).then_some((grant_path, leaked))
+                        })
+                {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -356,47 +360,50 @@ impl LandlockSandbox {
                                 "leaked_rights": format!("{leaked:?}"),
                             })),
                         "Skipping unenforceable allowed root in Landlock ruleset: \
-                         an overlapping rule already grants rights this tier withholds"
+                         a generic allow-list rule already grants rights this tier withholds"
                     );
                     continue;
                 }
-            }
 
-            // Unlike the workspace above, an absent root here is skipped rather than
-            // fatal. These roots are policy-generated, not operator-typed, and the
-            // policy emits them before anything creates them: `SecurityPolicy::for_agent`
-            // unconditionally pushes `<install>/shared/skills` into the read-only tier
-            // while fresh config initialization creates `<install>/shared` without that
-            // child, and a cross-agent grant can name a sibling workspace that its own
-            // agent has not materialized yet.
-            //
-            // Failing closed on those is not a safe default but a total outage: the
-            // error surfaces from `build_ruleset` inside `wrap_command`, so the *first*
-            // absent root stops every sandboxed command from spawning at all — not just
-            // access to the missing path. Skipping keeps the kernel boundary strictly
-            // tighter than policy, which is the safe direction, and the omission is
-            // recorded at DEBUG so it stays diagnosable.
-            match PathFd::new(root) {
-                Ok(root_fd) => {
-                    ruleset = ruleset
-                        .add_rule(PathBeneath::new(root_fd, perm))
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                }
-                Err(PathFdError::OpenCall { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                // Unlike the workspace above, an absent root here is skipped rather than
+                // fatal. These roots are policy-generated, not operator-typed, and the
+                // policy emits them before anything creates them: `SecurityPolicy::for_agent`
+                // unconditionally pushes `<install>/shared/skills` into the read-only tier
+                // while fresh config initialization creates `<install>/shared` without that
+                // child, and a cross-agent grant can name a sibling workspace that its own
+                // agent has not materialized yet.
+                //
+                // Failing closed on those is not a safe default but a total outage: the
+                // error surfaces from `build_ruleset` inside `wrap_command`, so the *first*
+                // absent root stops every sandboxed command from spawning at all — not just
+                // access to the missing path. Skipping keeps the kernel boundary strictly
+                // tighter than policy, which is the safe direction, and the omission is
+                // recorded at DEBUG so it stays diagnosable.
+                match PathFd::new(root) {
+                    Ok(root_fd) => {
+                        ruleset = ruleset
+                            .add_rule(PathBeneath::new(root_fd, perm))
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Err(PathFdError::OpenCall { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_attrs(::serde_json::json!({
                                 "root": root.display().to_string(),
                                 "tier": tier,
                             })),
-                        "Skipping absent allowed root in Landlock ruleset"
-                    );
-                }
-                Err(e) => {
-                    return Err(std::io::Error::other(e.to_string()));
+                            "Skipping absent allowed root in Landlock ruleset"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(std::io::Error::other(e.to_string()));
+                    }
                 }
             }
         }

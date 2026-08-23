@@ -854,17 +854,16 @@ fn landlock_tier_root_beneath_generic_rule_is_not_installed() {
     }
 }
 
-/// The same contract for the other recursive rule an operator can trip over:
-/// the workspace itself, which is granted read-write.
+/// A read-only root *inside* the workspace keeps the workspace's write right.
 ///
-/// A read-only root *inside* the workspace is unenforceable for the same
-/// reason, so its rule is skipped and the path keeps the workspace's rights.
-/// This test pins that outcome deliberately: the honest behaviour is that the
-/// tier is not enforced there, and pretending otherwise is exactly the defect
-/// the skip exists to avoid. Moving the root out from under the workspace makes
-/// it enforceable again.
+/// This is composition, not a bypass: `SecurityPolicy` grants read and write
+/// everywhere beneath `workspace_dir` before it ever consults the tiers
+/// (`is_resolved_path_allowed` returns at the workspace check), so read+write is
+/// the application-layer contract for that path too. Landlock unions the
+/// workspace rule with the tier rule and lands on the same answer. The tier rule
+/// is installed — it simply adds nothing the workspace had not already granted.
 #[test]
-fn landlock_tier_root_inside_workspace_is_not_installed() {
+fn landlock_tier_root_inside_workspace_composes_with_workspace_grant() {
     let _serialized = serialize_test();
     use tempfile::tempdir;
 
@@ -887,8 +886,8 @@ fn landlock_tier_root_inside_workspace_is_not_installed() {
             &sandbox,
             &format!("echo overwritten > {}", nested_file.display())
         ),
-        "a read-only root inside the workspace is unenforceable: the workspace's \
-         write right applies and the tier rule is skipped rather than advertised",
+        "a read-only root inside the workspace composes with the workspace's \
+         read-write grant, exactly as SecurityPolicy composes them",
     );
     assert_eq!(
         std::fs::read_to_string(&nested_file).expect("parent must read the nested file"),
@@ -903,9 +902,188 @@ fn landlock_tier_root_inside_workspace_is_not_installed() {
             &sandbox,
             &format!("echo bad > {} 2>/dev/null", denied.display())
         ),
-        "skipping an unenforceable root must not grant access outside the workspace",
+        "the nested tier root must not grant access outside the workspace",
     );
     assert!(!denied.exists(), "the outside write must not have happened");
 
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// Regression: nested restrictive tiers must compose, not cancel.
+///
+/// `SecurityPolicy` resolves a path by taking the first tier that matches:
+/// `is_resolved_path_readable` admits anything beneath a read-only root, and
+/// `is_resolved_path_allowed` admits anything beneath a write-only root. A
+/// write-only root nested inside a read-only root is therefore both readable
+/// and writable at the application layer, and Landlock — which unions the
+/// rights of every rule covering a path — reproduces that by installing both
+/// rules.
+///
+/// An earlier revision of the overlap check compared each tier against every
+/// other grant, so the read-only parent saw the write-only child's write rights
+/// and the write-only child saw the read-only parent's read rights, and *both*
+/// rules were skipped. That left a valid configuration with neither read nor
+/// write at the child boundary.
+#[test]
+fn landlock_read_only_parent_with_write_only_child_composes() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let parent = outside_root("compose_ro_parent");
+    let child = parent.join("write-only-child");
+    std::fs::create_dir_all(&child).expect("failed to create nested write-only root");
+
+    let parent_file = parent.join("parent.txt");
+    let child_file = child.join("child.txt");
+    std::fs::write(&parent_file, "seed").expect("parent must seed the read-only root");
+    std::fs::write(&child_file, "seed").expect("parent must seed the nested root");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        vec![parent.clone()],
+        vec![child.clone()],
+    )
+    .expect("landlock should succeed on linux with feature enabled");
+
+    // Read comes from the read-only parent, recursively.
+    assert!(
+        run_sandboxed(
+            &sandbox,
+            &format!("cat {} > /dev/null", child_file.display())
+        ),
+        "the nested write-only root must stay readable through the read-only parent",
+    );
+    // Write comes from the write-only child: `MakeReg` is granted by that tier
+    // and by neither the parent nor any generic rule.
+    let created = child.join("created.txt");
+    assert!(
+        run_sandboxed(&sandbox, &format!("echo created > {}", created.display())),
+        "the nested write-only root must permit creating a file",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&created).expect("parent must read the created file"),
+        "created\n",
+    );
+
+    // The read-only parent keeps its own boundary outside the nested child.
+    assert!(
+        run_sandboxed(
+            &sandbox,
+            &format!("cat {} > /dev/null", parent_file.display())
+        ),
+        "the read-only parent must stay readable",
+    );
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("echo bad > {} 2>/dev/null", parent_file.display())
+        ),
+        "the read-only parent must stay read-only outside the nested write-only child",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&parent_file).expect("parent must read its file"),
+        "seed",
+    );
+
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// The mirror image: a read-only root nested inside a write-only root.
+///
+/// The composed contract is the same — read from the nested read-only rule,
+/// write from the enclosing write-only rule — and the enclosing root stays
+/// unreadable outside the nested child.
+#[test]
+fn landlock_write_only_parent_with_read_only_child_composes() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let parent = outside_root("compose_wo_parent");
+    let child = parent.join("read-only-child");
+    std::fs::create_dir_all(&child).expect("failed to create nested read-only root");
+
+    let parent_file = parent.join("parent.txt");
+    let child_file = child.join("child.txt");
+    std::fs::write(&parent_file, "seed").expect("parent must seed the write-only root");
+    std::fs::write(&child_file, "seed").expect("parent must seed the nested root");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        vec![child.clone()],
+        vec![parent.clone()],
+    )
+    .expect("landlock should succeed on linux with feature enabled");
+
+    assert!(
+        run_sandboxed(
+            &sandbox,
+            &format!("cat {} > /dev/null", child_file.display())
+        ),
+        "the nested read-only root must be readable",
+    );
+    let created = child.join("created.txt");
+    assert!(
+        run_sandboxed(&sandbox, &format!("echo created > {}", created.display())),
+        "the nested root must stay writable through the enclosing write-only parent",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&created).expect("parent must read the created file"),
+        "created\n",
+    );
+
+    // The write-only parent stays unreadable where the nested read grant does
+    // not reach.
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("cat {} > /dev/null 2>/dev/null", parent_file.display())
+        ),
+        "the write-only parent must stay unreadable outside the nested read-only child",
+    );
+
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// The degenerate overlap: one path listed in both restrictive tiers.
+///
+/// `SecurityPolicy` admits it for reads via the read-only list and for writes
+/// via the write-only list, so the composed contract is read+write and the two
+/// rules must union rather than cancel.
+#[test]
+fn landlock_root_in_both_restrictive_tiers_composes() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let root = outside_root("compose_both_tiers");
+    let seeded = root.join("seed.txt");
+    std::fs::write(&seeded, "seed").expect("parent must seed the root");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        vec![root.clone()],
+        vec![root.clone()],
+    )
+    .expect("landlock should succeed on linux with feature enabled");
+
+    assert!(
+        run_sandboxed(&sandbox, &format!("cat {} > /dev/null", seeded.display())),
+        "a root in both restrictive tiers must be readable",
+    );
+    let created = root.join("created.txt");
+    assert!(
+        run_sandboxed(&sandbox, &format!("echo created > {}", created.display())),
+        "a root in both restrictive tiers must be writable",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&created).expect("parent must read the created file"),
+        "created\n",
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
