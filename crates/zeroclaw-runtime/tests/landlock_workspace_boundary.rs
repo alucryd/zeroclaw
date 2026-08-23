@@ -731,3 +731,181 @@ fn landlock_absent_extra_root_does_not_disable_sandbox() {
 
     let _ = std::fs::remove_dir_all(&outside);
 }
+
+/// Create a unique, empty directory directly beneath `/tmp`.
+///
+/// The opposite of [`outside_root`]: this one is deliberately *inside* the
+/// generic allow-list, which already grants `/tmp`
+/// `ReadFile | WriteFile | Truncate` recursively.
+fn tmp_root(tag: &str) -> PathBuf {
+    let dir = Path::new("/tmp").join(format!("zc_overlap_{tag}_{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("failed to clear leftover /tmp root");
+    }
+    std::fs::create_dir_all(&dir).expect("failed to create /tmp root");
+    dir
+}
+
+/// Regression: a restrictive tier root that overlaps a broader rule must not
+/// have its rule installed, because Landlock cannot honour it.
+///
+/// Landlock rules are additive within a layer — for a given file the kernel
+/// unions the rights of every rule whose subtree contains it — so a rule can
+/// never subtract a right a broader rule already granted. `/tmp` is granted
+/// `ReadFile | WriteFile | Truncate` recursively, so a read-only root beneath
+/// `/tmp` stays writable and a write-only root beneath it stays readable no
+/// matter what their own rules say. Installing those rules anyway advertised a
+/// boundary the kernel does not implement.
+///
+/// The skip is observable because the tiers grant rights `/tmp` does not:
+/// `ReadDir` for the read-only tier and `MakeReg` for the write-only tier. If
+/// the rules were installed, listing the read-only root and creating a file in
+/// the write-only root would both succeed. The matching roots outside `/tmp`
+/// prove the denials come from the skip and not from the environment.
+#[test]
+fn landlock_tier_root_beneath_generic_rule_is_not_installed() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let overlapping_ro = tmp_root("ro");
+    let overlapping_wo = tmp_root("wo");
+    let enforceable_ro = outside_root("enforceable_ro");
+    let enforceable_wo = outside_root("enforceable_wo");
+
+    std::fs::write(overlapping_ro.join("seed.txt"), "seed").expect("parent must seed the ro root");
+    std::fs::write(enforceable_ro.join("seed.txt"), "seed").expect("parent must seed the ro root");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        vec![overlapping_ro.clone(), enforceable_ro.clone()],
+        vec![overlapping_wo.clone(), enforceable_wo.clone()],
+    )
+    .expect("an unenforceable root must not make Landlock unavailable");
+
+    // The sandbox must stay usable: skipping is not an outage.
+    assert!(
+        run_sandboxed(&sandbox, "echo hello > /dev/null"),
+        "a sandboxed command must still spawn when a tier root is unenforceable",
+    );
+
+    // Read-only tier: `ReadDir` is granted by the tier and not by `/tmp`.
+    assert!(
+        run_sandboxed(
+            &sandbox,
+            &format!("ls {} > /dev/null 2>&1", enforceable_ro.display())
+        ),
+        "an enforceable read-only root must be listable, or the denial below proves nothing",
+    );
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("ls {} > /dev/null 2>&1", overlapping_ro.display())
+        ),
+        "the read-only rule for a root beneath /tmp must not have been installed",
+    );
+
+    // Write-only tier: `MakeReg` is granted by the tier and not by `/tmp`.
+    let enforceable_new = enforceable_wo.join("created.txt");
+    let overlapping_new = overlapping_wo.join("created.txt");
+    assert!(
+        run_sandboxed(
+            &sandbox,
+            &format!("echo created > {}", enforceable_new.display())
+        ),
+        "an enforceable write-only root must permit creation, or the denial below proves nothing",
+    );
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("echo created > {} 2>/dev/null", overlapping_new.display())
+        ),
+        "the write-only rule for a root beneath /tmp must not have been installed",
+    );
+    assert!(
+        !overlapping_new.exists(),
+        "the write-only creation beneath /tmp must not have happened",
+    );
+
+    // Skipping withholds a rule; it does not withdraw access. The path keeps
+    // exactly the rights `/tmp` already gave it, which is what it had before any
+    // tier was propagated — the point is that the tier is no longer advertised
+    // as a boundary it never was. The WARN emitted at construction is the
+    // operator-facing half of this contract.
+    assert!(
+        run_sandboxed(
+            &sandbox,
+            &format!(
+                "cat {} > /dev/null",
+                overlapping_ro.join("seed.txt").display()
+            )
+        ),
+        "skipping the rule must leave /tmp's pre-existing ReadFile grant untouched",
+    );
+
+    for dir in [
+        &overlapping_ro,
+        &overlapping_wo,
+        &enforceable_ro,
+        &enforceable_wo,
+    ] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// The same contract for the other recursive rule an operator can trip over:
+/// the workspace itself, which is granted read-write.
+///
+/// A read-only root *inside* the workspace is unenforceable for the same
+/// reason, so its rule is skipped and the path keeps the workspace's rights.
+/// This test pins that outcome deliberately: the honest behaviour is that the
+/// tier is not enforced there, and pretending otherwise is exactly the defect
+/// the skip exists to avoid. Moving the root out from under the workspace makes
+/// it enforceable again.
+#[test]
+fn landlock_tier_root_inside_workspace_is_not_installed() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let nested_ro = workspace.path().join("declared-read-only");
+    std::fs::create_dir_all(&nested_ro).expect("failed to create nested root");
+    let nested_file = nested_ro.join("seed.txt");
+    std::fs::write(&nested_file, "seed").expect("parent must seed the nested root");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        vec![nested_ro.clone()],
+        Vec::new(),
+    )
+    .expect("an unenforceable root must not make Landlock unavailable");
+
+    assert!(
+        run_sandboxed(
+            &sandbox,
+            &format!("echo overwritten > {}", nested_file.display())
+        ),
+        "a read-only root inside the workspace is unenforceable: the workspace's \
+         write right applies and the tier rule is skipped rather than advertised",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&nested_file).expect("parent must read the nested file"),
+        "overwritten\n",
+    );
+
+    // Skipping must not disturb the boundary that *is* enforceable.
+    let outside = outside_root("workspace_overlap_boundary");
+    let denied = outside.join("should_not_be_created.txt");
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("echo bad > {} 2>/dev/null", denied.display())
+        ),
+        "skipping an unenforceable root must not grant access outside the workspace",
+    );
+    assert!(!denied.exists(), "the outside write must not have happened");
+
+    let _ = std::fs::remove_dir_all(&outside);
+}

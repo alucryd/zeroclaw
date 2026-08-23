@@ -4,13 +4,13 @@
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use landlock::{
-    AccessFs, Errno, PathBeneath, PathFd, PathFdError, Ruleset, RulesetAttr, RulesetCreated,
-    RulesetCreatedAttr,
+    AccessFs, BitFlags, Errno, PathBeneath, PathFd, PathFdError, Ruleset, RulesetAttr,
+    RulesetCreated, RulesetCreatedAttr,
 };
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use std::os::unix::process::CommandExt;
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::security::traits::Sandbox;
 
@@ -28,6 +28,158 @@ pub struct LandlockSandbox {
     /// Extra roots the agent may write but NOT read, mirroring
     /// `SecurityPolicy::allowed_roots_write_only`.
     allowed_roots_write_only: Vec<std::path::PathBuf>,
+}
+
+/// Every access right this backend's ruleset arbitrates.
+///
+/// Landlock only reasons about *handled* rights: anything outside this set is
+/// neither granted nor withheld by any rule below. It is therefore also the
+/// universe against which a tier's withheld rights are computed — a tier
+/// cannot be undercut on a right Landlock never mediates.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn handled_access() -> BitFlags<AccessFs> {
+    AccessFs::Execute
+        | AccessFs::WriteFile
+        | AccessFs::ReadFile
+        | AccessFs::Truncate
+        | AccessFs::ReadDir
+        | AccessFs::RemoveDir
+        | AccessFs::RemoveFile
+        | AccessFs::MakeChar
+        | AccessFs::MakeDir
+        | AccessFs::MakeReg
+        | AccessFs::MakeSock
+        | AccessFs::MakeFifo
+        | AccessFs::MakeBlock
+        | AccessFs::MakeSym
+}
+
+/// Rights granted to a read-write root: the primary workspace and every entry
+/// of `SecurityPolicy::allowed_roots`.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn read_write_access() -> BitFlags<AccessFs> {
+    AccessFs::Execute
+        | AccessFs::WriteFile
+        | AccessFs::ReadFile
+        | AccessFs::Truncate
+        | AccessFs::ReadDir
+        | AccessFs::RemoveDir
+        | AccessFs::RemoveFile
+        | AccessFs::MakeDir
+        | AccessFs::MakeReg
+        | AccessFs::MakeSock
+        | AccessFs::MakeFifo
+        | AccessFs::MakeSym
+}
+
+/// Rights granted to `SecurityPolicy::allowed_roots_read_only`.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn read_only_access() -> BitFlags<AccessFs> {
+    AccessFs::ReadFile | AccessFs::ReadDir
+}
+
+/// Rights granted to `SecurityPolicy::allowed_roots_write_only`.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn write_only_access() -> BitFlags<AccessFs> {
+    AccessFs::WriteFile
+        | AccessFs::Truncate
+        | AccessFs::RemoveDir
+        | AccessFs::RemoveFile
+        | AccessFs::MakeDir
+        | AccessFs::MakeReg
+        | AccessFs::MakeSock
+        | AccessFs::MakeFifo
+        | AccessFs::MakeSym
+}
+
+/// The static, workspace-independent rules every sandboxed child receives.
+///
+/// `required = true`  -> fail closed if the path is missing (baseline devices, system roots).
+/// `required = false` -> skip on NotFound (distro-optional loader/layout paths).
+///
+/// Hoisted out of `build_ruleset` so the overlap check below and the rules
+/// actually installed come from one list: a rule added here that the check
+/// never saw would silently reintroduce the tier bypass it exists to catch.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn generic_rules() -> [(&'static str, BitFlags<AccessFs>, bool); 10] {
+    [
+        // /tmp: general temp directory for child processes (pipes, sockets, temp files).
+        // Execute is intentionally omitted to prevent running untrusted binaries from /tmp.
+        (
+            "/tmp",
+            AccessFs::Truncate | AccessFs::WriteFile | AccessFs::ReadFile,
+            true,
+        ),
+        // Linux dynamic linker (ld-linux-yourarch.so.version) which designed to run on FHS 3.0
+        // system will read the following file/directories to retrieve dynamic linker config.
+        // These are optional: minimal systems may not have all of them.
+        ("/etc/ld.so.cache", AccessFs::ReadFile.into(), false),
+        ("/etc/ld.so.conf", AccessFs::ReadFile.into(), false),
+        ("/etc/ld.so.preload", AccessFs::ReadFile.into(), false),
+        (
+            "/etc/ld.so.conf.d",
+            AccessFs::ReadFile | AccessFs::ReadDir,
+            false,
+        ),
+        // In FHS 3.0 systems, system binaries will live in the following directories:
+        // /usr/bin, /usr/lib, /usr/lib64, /bin, /lib, /lib64.
+        // Execute: needed to run binaries (execve) and for the dynamic linker's
+        // access(X_OK) checks on shared libraries.
+        //
+        // /usr is optional: Non-FHS distros may not have it.
+        (
+            "/usr",
+            AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+            false,
+        ),
+        (
+            "/bin",
+            AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+            true,
+        ),
+        // /lib and /lib64 are distro-optional: some systems have one, some both.
+        (
+            "/lib",
+            AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+            false,
+        ),
+        (
+            "/lib64",
+            AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+            false,
+        ),
+        // some variant of sh requires access to /dev/null
+        ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+    ]
+}
+
+/// Rights an overlapping rule leaks into a tier root, i.e. the rights the tier
+/// deliberately withholds that some other rule grants anyway.
+///
+/// Landlock rules are **additive within a layer**: for a given file the kernel
+/// takes the union of the rights of every rule whose subtree contains it. A
+/// rule can therefore never subtract a right that a broader — or merely
+/// overlapping — rule already granted. `/tmp` is granted
+/// `ReadFile | WriteFile | Truncate` recursively for every child, so a
+/// read-only root beneath `/tmp` would still be writable, and a write-only
+/// root beneath it would still be readable, no matter what its own rule says.
+///
+/// The test is symmetric on containment because both rules are `PathBeneath`
+/// (recursive): whichever of the two is the ancestor, the union applies
+/// somewhere inside the tier root.
+///
+/// Returns an empty set when the tier stays authoritative.
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn leaked_rights(
+    root: &Path,
+    root_perm: BitFlags<AccessFs>,
+    grant: &Path,
+    grant_perm: BitFlags<AccessFs>,
+) -> BitFlags<AccessFs> {
+    if !(root.starts_with(grant) || grant.starts_with(root)) {
+        return BitFlags::empty();
+    }
+    (handled_access() & !root_perm) & grant_perm
 }
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
@@ -96,22 +248,7 @@ impl LandlockSandbox {
     /// child is restricted — the daemon (parent) process is never affected.
     fn build_ruleset(&self) -> std::io::Result<RulesetCreated> {
         let mut ruleset = Ruleset::default()
-            .handle_access(
-                AccessFs::Execute
-                    | AccessFs::WriteFile
-                    | AccessFs::ReadFile
-                    | AccessFs::Truncate
-                    | AccessFs::ReadDir
-                    | AccessFs::RemoveDir
-                    | AccessFs::RemoveFile
-                    | AccessFs::MakeChar
-                    | AccessFs::MakeDir
-                    | AccessFs::MakeReg
-                    | AccessFs::MakeSock
-                    | AccessFs::MakeFifo
-                    | AccessFs::MakeBlock
-                    | AccessFs::MakeSym,
-            )
+            .handle_access(handled_access())
             .and_then(|ruleset| ruleset.create())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -122,153 +259,150 @@ impl LandlockSandbox {
             let workspace_fd =
                 PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
             ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    workspace_fd,
-                    AccessFs::Execute
-                        | AccessFs::WriteFile
-                        | AccessFs::ReadFile
-                        | AccessFs::Truncate
-                        | AccessFs::ReadDir
-                        | AccessFs::RemoveDir
-                        | AccessFs::RemoveFile
-                        | AccessFs::MakeDir
-                        | AccessFs::MakeReg
-                        | AccessFs::MakeSock
-                        | AccessFs::MakeFifo
-                        | AccessFs::MakeSym,
-                ))
+                .add_rule(PathBeneath::new(workspace_fd, read_write_access()))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
-        // Allow the extra `SecurityPolicy` root tiers (cross-agent grants,
-        // `[autonomy].allowed_roots`, etc.).
-        //
-        // Unlike the workspace above, an absent root here is skipped rather than
-        // fatal. These roots are policy-generated, not operator-typed, and the
-        // policy emits them before anything creates them: `SecurityPolicy::for_agent`
-        // unconditionally pushes `<install>/shared/skills` into the read-only tier
-        // while fresh config initialization creates `<install>/shared` without that
-        // child, and a cross-agent grant can name a sibling workspace that its own
-        // agent has not materialized yet.
-        //
-        // Failing closed on those is not a safe default but a total outage: the
-        // error surfaces from `build_ruleset` inside `wrap_command`, so the *first*
-        // absent root stops every sandboxed command from spawning at all — not just
-        // access to the missing path. Skipping keeps the kernel boundary strictly
-        // tighter than policy, which is the safe direction, and the omission is
-        // recorded at DEBUG so it stays diagnosable.
-        for (roots, perm) in [
+        // The extra `SecurityPolicy` root tiers (cross-agent grants,
+        // `[autonomy].allowed_roots`, etc.), paired with the rights that give
+        // each tier its meaning.
+        let tiers: [(&'static str, &Vec<PathBuf>, BitFlags<AccessFs>); 3] = [
+            ("allowed_roots", &self.allowed_roots, read_write_access()),
             (
-                &self.allowed_roots,
-                AccessFs::Execute
-                    | AccessFs::WriteFile
-                    | AccessFs::ReadFile
-                    | AccessFs::Truncate
-                    | AccessFs::ReadDir
-                    | AccessFs::RemoveDir
-                    | AccessFs::RemoveFile
-                    | AccessFs::MakeDir
-                    | AccessFs::MakeReg
-                    | AccessFs::MakeSock
-                    | AccessFs::MakeFifo
-                    | AccessFs::MakeSym,
-            ),
-            (
+                "allowed_roots_read_only",
                 &self.allowed_roots_read_only,
-                AccessFs::ReadFile | AccessFs::ReadDir,
+                read_only_access(),
             ),
             (
+                "allowed_roots_write_only",
                 &self.allowed_roots_write_only,
-                AccessFs::WriteFile
-                    | AccessFs::Truncate
-                    | AccessFs::RemoveDir
-                    | AccessFs::RemoveFile
-                    | AccessFs::MakeDir
-                    | AccessFs::MakeReg
-                    | AccessFs::MakeSock
-                    | AccessFs::MakeFifo
-                    | AccessFs::MakeSym,
+                write_only_access(),
             ),
-        ] {
+        ];
+
+        // Every recursive grant this ruleset will contain, resolved to the path
+        // the kernel actually sees. A tier root has to be checked against all of
+        // them — including the other tiers — because Landlock unions the rights
+        // of overlapping rules (see `leaked_rights`).
+        //
+        // `canonicalize` doubles as the "will this rule be installed at all?"
+        // test: it fails for exactly the absent paths that are skipped below, so
+        // a rule that is never added cannot manufacture a false conflict. Its
+        // symlink resolution also means overlap is decided on real paths rather
+        // than on however config happened to spell them. A path that exists but
+        // cannot be canonicalized (no search permission on a parent) is simply
+        // left out of the comparison; the rule is still installed, so this errs
+        // toward the pre-existing behaviour rather than toward silent skipping.
+        let mut grants: Vec<(PathBuf, BitFlags<AccessFs>)> = Vec::new();
+        if let Some(ref workspace) = self.workspace_dir
+            && let Ok(resolved) = workspace.canonicalize()
+        {
+            grants.push((resolved, read_write_access()));
+        }
+        for (path, perm, _) in generic_rules() {
+            if let Ok(resolved) = Path::new(path).canonicalize() {
+                grants.push((resolved, perm));
+            }
+        }
+
+        // Tier roots carry the index they occupy in `grants` so each one can be
+        // compared against every *other* grant without matching itself.
+        let mut tier_roots: Vec<(&'static str, &PathBuf, BitFlags<AccessFs>, Option<usize>)> =
+            Vec::new();
+        for (tier, roots, perm) in tiers {
             for root in roots {
-                match PathFd::new(root) {
-                    Ok(root_fd) => {
-                        ruleset = ruleset
-                            .add_rule(PathBeneath::new(root_fd, perm))
-                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let index = match root.canonicalize() {
+                    Ok(resolved) => {
+                        grants.push((resolved, perm));
+                        Some(grants.len() - 1)
                     }
-                    Err(PathFdError::OpenCall { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"root": root.display().to_string()})),
-                            "Skipping absent allowed root in Landlock ruleset"
-                        );
-                    }
-                    Err(e) => {
-                        return Err(std::io::Error::other(e.to_string()));
-                    }
+                    Err(_) => None,
+                };
+                tier_roots.push((tier, root, perm, index));
+            }
+        }
+
+        for (tier, root, perm, index) in tier_roots {
+            // A tier whose rights are undercut by an overlapping rule is not
+            // enforceable, and installing its rule anyway would advertise a
+            // boundary the kernel does not implement: the read-only root would
+            // still be writable, the write-only root still readable. Skip the
+            // rule and say so at WARN.
+            //
+            // Skipping is not a loss of protection — the path keeps exactly the
+            // rights the overlapping rule already gave it, which is what it had
+            // before any tier was propagated — but it is the difference between
+            // a boundary that is absent and one that is falsely advertised. The
+            // fix belongs in configuration: move the root out from under the
+            // broader rule (`/tmp`, the workspace, a read-write root) and the
+            // tier becomes enforceable again.
+            if let Some(index) = index {
+                let leaked = grants
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != index)
+                    .find_map(|(_, (grant_path, grant_perm))| {
+                        let leaked = leaked_rights(&grants[index].0, perm, grant_path, *grant_perm);
+                        (!leaked.is_empty()).then_some((grant_path.clone(), leaked))
+                    });
+                if let Some((grant_path, leaked)) = leaked {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "root": root.display().to_string(),
+                                "tier": tier,
+                                "overlapping_rule": grant_path.display().to_string(),
+                                "leaked_rights": format!("{leaked:?}"),
+                            })),
+                        "Skipping unenforceable allowed root in Landlock ruleset: \
+                         an overlapping rule already grants rights this tier withholds"
+                    );
+                    continue;
+                }
+            }
+
+            // Unlike the workspace above, an absent root here is skipped rather than
+            // fatal. These roots are policy-generated, not operator-typed, and the
+            // policy emits them before anything creates them: `SecurityPolicy::for_agent`
+            // unconditionally pushes `<install>/shared/skills` into the read-only tier
+            // while fresh config initialization creates `<install>/shared` without that
+            // child, and a cross-agent grant can name a sibling workspace that its own
+            // agent has not materialized yet.
+            //
+            // Failing closed on those is not a safe default but a total outage: the
+            // error surfaces from `build_ruleset` inside `wrap_command`, so the *first*
+            // absent root stops every sandboxed command from spawning at all — not just
+            // access to the missing path. Skipping keeps the kernel boundary strictly
+            // tighter than policy, which is the safe direction, and the omission is
+            // recorded at DEBUG so it stays diagnosable.
+            match PathFd::new(root) {
+                Ok(root_fd) => {
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(root_fd, perm))
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Err(PathFdError::OpenCall { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "root": root.display().to_string(),
+                                "tier": tier,
+                            })),
+                        "Skipping absent allowed root in Landlock ruleset"
+                    );
+                }
+                Err(e) => {
+                    return Err(std::io::Error::other(e.to_string()));
                 }
             }
         }
 
         // Allow paths for general operations.
-        // `required = true`  -> fail closed if the path is missing (baseline devices, system roots).
-        // `required = false` -> skip on NotFound (distro-optional loader/layout paths).
-        for (allow_path, perm, required) in [
-            // /tmp: general temp directory for child processes (pipes, sockets, temp files).
-            // Execute is intentionally omitted to prevent running untrusted binaries from /tmp.
-            (
-                "/tmp",
-                AccessFs::Truncate | AccessFs::WriteFile | AccessFs::ReadFile,
-                true,
-            ),
-            // Linux dynamic linker (ld-linux-yourarch.so.version) which designed to run on FHS 3.0
-            // system will read the following file/directories to retrieve dynamic linker config.
-            // These are optional: minimal systems may not have all of them.
-            ("/etc/ld.so.cache", AccessFs::ReadFile.into(), false),
-            ("/etc/ld.so.conf", AccessFs::ReadFile.into(), false),
-            ("/etc/ld.so.preload", AccessFs::ReadFile.into(), false),
-            (
-                "/etc/ld.so.conf.d",
-                AccessFs::ReadFile | AccessFs::ReadDir,
-                false,
-            ),
-            // In FHS 3.0 systems, system binaries will live in the following directories:
-            // /usr/bin, /usr/lib, /usr/lib64, /bin, /lib, /lib64.
-            // Execute: needed to run binaries (execve) and for the dynamic linker's
-            // access(X_OK) checks on shared libraries.
-            //
-            // /usr is optional: Non-FHS distros may not have it.
-            (
-                "/usr",
-                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
-                false,
-            ),
-            (
-                "/bin",
-                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
-                true,
-            ),
-            // /lib and /lib64 are distro-optional: some systems have one, some both.
-            (
-                "/lib",
-                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
-                false,
-            ),
-            (
-                "/lib64",
-                AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
-                false,
-            ),
-            // some variant of sh requires access to /dev/null
-            ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
-        ] {
+        for (allow_path, perm, required) in generic_rules() {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {
                     ruleset = ruleset
@@ -478,6 +612,103 @@ impl Sandbox for LandlockSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overlap predicate that decides whether a tier stays authoritative.
+    ///
+    /// Landlock unions the rights of every rule covering a path, so a tier root
+    /// beneath a broader rule silently inherits whatever that rule grants. These
+    /// cases pin the three outcomes that matter: a tier undercut by `/tmp`, a
+    /// tier that `/tmp` cannot undercut, and a tier far enough away to be
+    /// unaffected.
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn leaked_rights_reports_tiers_undercut_by_a_broader_rule() {
+        let tmp = Path::new("/tmp");
+        let tmp_perm = AccessFs::Truncate | AccessFs::WriteFile | AccessFs::ReadFile;
+
+        // A read-only root beneath /tmp keeps /tmp's write rights.
+        let leaked = leaked_rights(
+            Path::new("/tmp/read-only-root"),
+            read_only_access(),
+            tmp,
+            tmp_perm,
+        );
+        assert_eq!(
+            leaked,
+            AccessFs::WriteFile | AccessFs::Truncate,
+            "a read-only root beneath /tmp must be reported as writable"
+        );
+
+        // A write-only root beneath /tmp keeps /tmp's read right.
+        let leaked = leaked_rights(
+            Path::new("/tmp/write-only-root"),
+            write_only_access(),
+            tmp,
+            tmp_perm,
+        );
+        assert_eq!(
+            leaked,
+            BitFlags::from(AccessFs::ReadFile),
+            "a write-only root beneath /tmp must be reported as readable"
+        );
+
+        // The read-write tier withholds only device-node creation, which no
+        // generic rule grants, so it is never undercut.
+        assert!(
+            leaked_rights(
+                Path::new("/tmp/read-write-root"),
+                read_write_access(),
+                tmp,
+                tmp_perm,
+            )
+            .is_empty(),
+            "a read-write root beneath /tmp must stay enforceable"
+        );
+
+        // No containment in either direction: /tmp cannot reach it.
+        assert!(
+            leaked_rights(
+                Path::new("/var/tmp/read-only-root"),
+                read_only_access(),
+                tmp,
+                tmp_perm,
+            )
+            .is_empty(),
+            "a root outside the generic allow-list must stay enforceable"
+        );
+
+        // Containment the other way round still unions inside the tier root.
+        assert!(
+            !leaked_rights(Path::new("/"), read_only_access(), tmp, tmp_perm).is_empty(),
+            "a tier root that *contains* a broader rule is undercut inside it"
+        );
+
+        // A sibling prefix is not a path prefix: /tmpfoo is not beneath /tmp.
+        assert!(
+            leaked_rights(
+                Path::new("/tmpfoo/read-only-root"),
+                read_only_access(),
+                tmp,
+                tmp_perm,
+            )
+            .is_empty(),
+            "overlap must compare path components, not string prefixes"
+        );
+    }
+
+    /// Every generic rule must be reachable by the overlap check: a rule that
+    /// grants rights the check never sees would reintroduce the bypass.
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn generic_rules_grant_only_handled_access() {
+        for (path, perm, _) in generic_rules() {
+            assert!(
+                (perm & !handled_access()).is_empty(),
+                "generic rule {path} grants a right the ruleset does not handle, \
+                 so no tier could ever withhold it"
+            );
+        }
+    }
 
     #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
     #[test]
