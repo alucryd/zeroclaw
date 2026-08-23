@@ -169,12 +169,21 @@ impl LandlockSandbox {
             ("/etc/gai.conf", AccessFs::ReadFile.into(), false),
             // systemd-resolved: /etc/resolv.conf is commonly a symlink into this
             // directory, and glibc's nss-resolve module connects to the
-            // `io.systemd.Resolve` varlink socket here. WriteFile is required
-            // because Landlock treats AF_UNIX connect() like a file open with
-            // read+write access rights.
+            // `io.systemd.Resolve` varlink socket here.
+            //
+            // Read-only on purpose. `PathBeneath` applies recursively, so a
+            // write right here would cover the resolver's own state files
+            // (`resolv.conf`, `stub-resolv.conf`) and let a sandboxed child
+            // rewrite DNS configuration wherever DAC allowed it — far more than
+            // reaching a socket. Connecting to the pathname AF_UNIX socket does
+            // not need a write right on the supported ABI surface (the locked
+            // `landlock` 0.4.5 tops out at ABI v7); this was verified by
+            // connecting to `io.systemd.Resolve` from a sandboxed child under a
+            // read-only rule, with `getaddrinfo` and HTTPS verification both
+            // still succeeding.
             (
                 "/run/systemd/resolve",
-                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+                AccessFs::ReadFile | AccessFs::ReadDir,
                 false,
             ),
             // TLS trust store: OpenSSL/GnuTLS read the CA bundle from here to
@@ -193,9 +202,15 @@ impl LandlockSandbox {
             // the *resolved* path, and on Arch-family systems the entries under
             // `/etc/ssl` are symlinks into `/etc/ca-certificates/extracted`
             // (`/etc/ssl/cert.pem` -> `../ca-certificates/extracted/tls-ca-bundle.pem`),
-            // so a rule covering only the link would authorize nothing. `/etc/pki`
-            // is the RHEL/Fedora layout. Debian's `/usr/share/ca-certificates`
-            // already falls under the `/usr` rule above.
+            // so a rule covering only the link would authorize nothing. Debian's
+            // `/usr/share/ca-certificates` already falls under the `/usr` rule
+            // above.
+            //
+            // The RHEL/Fedora layout gets the same subpath treatment for the same
+            // reason: `/etc/pki` as a whole would recursively cover
+            // `/etc/pki/tls/private`, where server private keys live alongside
+            // the public trust material. Only the certificate and trust-anchor
+            // subtrees are granted.
             //
             // ReadDir is required alongside ReadFile because OpenSSL's hashed
             // `capath` lookup (`/etc/ssl/certs`) enumerates the directory.
@@ -213,7 +228,20 @@ impl LandlockSandbox {
                 AccessFs::ReadFile | AccessFs::ReadDir,
                 false,
             ),
-            ("/etc/pki", AccessFs::ReadFile | AccessFs::ReadDir, false),
+            // RHEL/Fedora: public certificates and extracted trust anchors only.
+            // `/etc/pki/tls/private` is deliberately never granted.
+            (
+                "/etc/pki/tls/certs",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            ("/etc/pki/tls/cert.pem", AccessFs::ReadFile.into(), false),
+            ("/etc/pki/tls/openssl.cnf", AccessFs::ReadFile.into(), false),
+            (
+                "/etc/pki/ca-trust",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
         ] {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {

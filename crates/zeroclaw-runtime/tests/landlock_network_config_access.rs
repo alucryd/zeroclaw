@@ -165,3 +165,85 @@ so the positive assertions above prove nothing' >&2; \
          exit status: {status}",
     );
 }
+
+/// The resolver and trust-store grants must stay read-only and must not extend
+/// to adjacent secret or state material.
+///
+/// The read rules are deliberately narrow: `/run/systemd/resolve` is granted
+/// without a write right, and the CA grants name certificate subpaths rather
+/// than `/etc/ssl` or `/etc/pki` wholesale, both of which recursively cover a
+/// `private/` directory holding server private keys.
+#[test]
+fn landlock_network_config_grants_stay_read_only_and_narrow() {
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp workspace");
+    let sandbox = LandlockSandbox::with_workspace(Some(workspace.path().to_path_buf()))
+        .expect("landlock should succeed on linux with feature enabled");
+
+    let mut script = String::from("set -e\n");
+    let mut asserted = 0usize;
+
+    // Resolver state must not be writable. `PathBeneath` is recursive, so a
+    // write right on the resolver directory would reach these files and let a
+    // sandboxed child rewrite DNS configuration.
+    //
+    // Note on strength: on a host where DAC already denies the write (these are
+    // normally root-owned), this pins the contract rather than isolating
+    // Landlock as the cause. It still fails loudly if the rule is widened on a
+    // deployment whose process identity can write them.
+    for state in [
+        "/run/systemd/resolve/resolv.conf",
+        "/run/systemd/resolve/stub-resolv.conf",
+    ] {
+        if Path::new(state).exists() {
+            script.push_str(&format!(
+                "if : > {state} 2>/dev/null; then \
+                    echo 'FAIL: resolver state {state} must not be writable' >&2; \
+                    exit 1; \
+                 fi\n",
+            ));
+            asserted += 1;
+        }
+    }
+
+    // Private-key directories that sit beside the granted trust material must
+    // stay unreachable. Only assert where the unrestricted parent can list the
+    // directory, so a denial in the child is attributable to Landlock rather
+    // than to DAC or the path being absent.
+    for private in ["/etc/ssl/private", "/etc/pki/tls/private"] {
+        let p = Path::new(private);
+        if p.is_dir() && std::fs::read_dir(p).is_ok() {
+            script.push_str(&format!(
+                "if ls {private} > /dev/null 2>&1; then \
+                    echo 'FAIL: {private} must not be reachable from the sandbox' >&2; \
+                    exit 1; \
+                 fi\n",
+            ));
+            asserted += 1;
+        }
+    }
+
+    assert!(
+        asserted > 0,
+        "no resolver-state or private-key path present to assert against — \
+         this host cannot verify the narrowness of the network-config grants",
+    );
+
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", &script]);
+    sandbox
+        .wrap_command(&mut cmd)
+        .expect("landlock should successfully wrap the command");
+    let status = cmd
+        .spawn()
+        .expect("should spawn bash under landlock restrictions")
+        .wait()
+        .expect("should wait for bash to complete");
+
+    assert!(
+        status.success(),
+        "network-config grants must be read-only and must not cover private-key \
+         or resolver-state material; exit status: {status}",
+    );
+}
