@@ -338,6 +338,11 @@ fn create_selected_sandbox(
             }
             #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
             {
+                // Landlock is the only backend that consumes the extra roots, so
+                // without it the parameter is genuinely unused. Bind it here to
+                // keep the signature uniform across cfgs without tripping
+                // `-D warnings` on the feature-disabled build.
+                let _ = extra_roots;
                 None
             }
         }

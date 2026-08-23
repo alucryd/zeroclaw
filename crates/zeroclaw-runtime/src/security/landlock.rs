@@ -53,18 +53,22 @@ impl LandlockSandbox {
         allowed_roots_read_only: Vec<std::path::PathBuf>,
         allowed_roots_write_only: Vec<std::path::PathBuf>,
     ) -> std::io::Result<Self> {
-        // Test if Landlock is available by trying to create a minimal ruleset
-        let test_ruleset = Ruleset::default()
-            .handle_access(AccessFs::ReadFile | AccessFs::WriteFile)
-            .and_then(|ruleset| ruleset.create());
+        let sandbox = Self {
+            workspace_dir,
+            allowed_roots,
+            allowed_roots_read_only,
+            allowed_roots_write_only,
+        };
 
-        match test_ruleset {
-            Ok(_) => Ok(Self {
-                workspace_dir,
-                allowed_roots,
-                allowed_roots_read_only,
-                allowed_roots_write_only,
-            }),
+        // Validate by building the ruleset the child will actually receive,
+        // rather than a minimal kernel probe. `landlock_available` and
+        // `sandbox_posture` both reach this constructor, while enforcement
+        // builds its ruleset later inside `wrap_command`. When the two disagree,
+        // posture reports the backend as active and every subsequent spawn
+        // fails — so availability has to be decided by the same ruleset
+        // construction that execution depends on.
+        match sandbox.build_ruleset() {
+            Ok(_) => Ok(sandbox),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -74,7 +78,7 @@ impl LandlockSandbox {
                 );
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "Landlock not available",
+                    format!("Landlock not available: {e}"),
                 ))
             }
         }
@@ -137,12 +141,22 @@ impl LandlockSandbox {
         }
 
         // Allow the extra `SecurityPolicy` root tiers (cross-agent grants,
-        // `[autonomy].allowed_roots`, etc.). Like the workspace above, a
-        // configured root that doesn't exist fails closed rather than
-        // silently running without a rule for it — the application layer
-        // already believes these paths are reachable, so a missing kernel
-        // rule would make Landlock the more restrictive (and inconsistent)
-        // authority instead of just enforcing the same boundary.
+        // `[autonomy].allowed_roots`, etc.).
+        //
+        // Unlike the workspace above, an absent root here is skipped rather than
+        // fatal. These roots are policy-generated, not operator-typed, and the
+        // policy emits them before anything creates them: `SecurityPolicy::for_agent`
+        // unconditionally pushes `<install>/shared/skills` into the read-only tier
+        // while fresh config initialization creates `<install>/shared` without that
+        // child, and a cross-agent grant can name a sibling workspace that its own
+        // agent has not materialized yet.
+        //
+        // Failing closed on those is not a safe default but a total outage: the
+        // error surfaces from `build_ruleset` inside `wrap_command`, so the *first*
+        // absent root stops every sandboxed command from spawning at all — not just
+        // access to the missing path. Skipping keeps the kernel boundary strictly
+        // tighter than policy, which is the safe direction, and the omission is
+        // recorded at DEBUG so it stays diagnosable.
         for (roots, perm) in [
             (
                 &self.allowed_roots,
@@ -177,11 +191,29 @@ impl LandlockSandbox {
             ),
         ] {
             for root in roots {
-                let root_fd =
-                    PathFd::new(root).map_err(|e| std::io::Error::other(e.to_string()))?;
-                ruleset = ruleset
-                    .add_rule(PathBeneath::new(root_fd, perm))
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                match PathFd::new(root) {
+                    Ok(root_fd) => {
+                        ruleset = ruleset
+                            .add_rule(PathBeneath::new(root_fd, perm))
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Err(PathFdError::OpenCall { source, .. })
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"root": root.display().to_string()})),
+                            "Skipping absent allowed root in Landlock ruleset"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(std::io::Error::other(e.to_string()));
+                    }
+                }
             }
         }
 

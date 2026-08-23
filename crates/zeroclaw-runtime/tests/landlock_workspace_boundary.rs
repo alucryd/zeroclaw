@@ -63,7 +63,18 @@ fn landlock_abi_version() -> u32 {
 /// cannot be proven.
 fn find_outside_dir() -> PathBuf {
     let candidates: &[&str] = &["/dev/shm", "/var/tmp"];
-    let pid = std::process::id();
+    // The probe filenames must be unique per *call*, not merely per process.
+    // Under `cargo test` the tests in this binary run as threads in one
+    // process, so a pid-only name makes concurrent callers share probe paths
+    // and delete each other's files mid-check — the function then reports
+    // "test environment is broken" for a collision it caused itself. (nextest,
+    // which CI uses, gives each test its own process and hides this.)
+    static PROBE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let pid = format!(
+        "{}_{}",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
 
     for &dir in candidates {
         let p = Path::new(dir);
@@ -116,8 +127,61 @@ fn find_outside_dir() -> PathBuf {
     );
 }
 
+/// Create a unique, empty directory outside the generic Landlock allow-list.
+///
+/// Extra-root tiers must be probed outside `/tmp`. The generic allow-list
+/// already grants `/tmp` `ReadFile | WriteFile | Truncate`, so a `tempdir()`
+/// root inherits those rights and a tier granting nothing at all would still
+/// look like it worked — while a tier's *denials* could equally be caused by
+/// rights `/tmp` never had (it has no `MakeReg`, so "cannot create a file"
+/// proves nothing about the tier). Only a root outside that set isolates the
+/// tier's own permission bits.
+fn outside_root(tag: &str) -> PathBuf {
+    let dir = find_outside_dir().join(format!("zc_root_{tag}_{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("failed to clear leftover outside root");
+    }
+    std::fs::create_dir_all(&dir).expect("failed to create outside root");
+    dir
+}
+
+/// Serializes the tests in this file.
+///
+/// These tests fork and exec repeatedly. `cargo test` runs them as threads in a
+/// single process, so one thread's `Command::spawn` can inherit a writable fd
+/// that another thread is about to execute, and the `execve` then fails with
+/// `ETXTBSY` ("Text file busy") — a harness artifact, not a sandbox defect. The
+/// module already assumes one process per test (nextest, which CI uses); this
+/// lock gives plain `cargo test` the same guarantee. The tests take ~10ms
+/// total, so serializing them costs nothing.
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the serialization lock, ignoring poisoning: a panic in one test must
+/// surface as that test's own failure, not as a cascade of poisoned-lock
+/// failures in the others.
+fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run `script` under `sandbox` and report whether it exited zero.
+fn run_sandboxed(sandbox: &LandlockSandbox, script: &str) -> bool {
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", script]);
+    sandbox
+        .wrap_command(&mut cmd)
+        .expect("landlock should successfully wrap the command");
+    cmd.spawn()
+        .expect("should spawn bash under landlock restrictions")
+        .wait()
+        .expect("should wait for bash to complete")
+        .success()
+}
+
 #[test]
 fn landlock_workspace_boundary() {
+    let _serialized = serialize_test();
     use tempfile::tempdir;
 
     // ── Setup: workspace and sandbox ──
@@ -460,23 +524,24 @@ fn landlock_workspace_boundary() {
 /// *more* restrictive than the configured policy.
 #[test]
 fn landlock_with_roots_grants_extra_allowed_root_access() {
+    let _serialized = serialize_test();
     use tempfile::tempdir;
 
     let workspace = tempdir().expect("failed to create temp directory");
-    let extra_rw = tempdir().expect("failed to create extra read-write root");
-    let extra_ro = tempdir().expect("failed to create extra read-only root");
+    let extra_rw = outside_root("rw");
+    let extra_ro = outside_root("ro");
 
     let sandbox = LandlockSandbox::with_roots(
         Some(workspace.path().to_path_buf()),
-        vec![extra_rw.path().to_path_buf()],
-        vec![extra_ro.path().to_path_buf()],
+        vec![extra_rw.clone()],
+        vec![extra_ro.clone()],
         Vec::new(),
     )
     .expect("landlock should succeed on linux with feature enabled");
 
-    let rw_file = extra_rw.path().join("rw.txt");
-    let ro_file = extra_ro.path().join("ro.txt");
-    let ro_write_target = extra_ro.path().join("should_not_be_created.txt");
+    let rw_file = extra_rw.join("rw.txt");
+    let ro_file = extra_ro.join("ro.txt");
+    let ro_write_target = extra_ro.join("should_not_be_created.txt");
 
     // Parent seeds the read-only root's content before the child runs.
     std::fs::write(&ro_file, "seed").expect("parent must seed read-only root content");
@@ -503,10 +568,22 @@ fn landlock_with_roots_grants_extra_allowed_root_access() {
         ro_file.display(),
     ));
 
-    // Negative: the read-only extra root must NOT be writable.
+    // Negative: overwriting an EXISTING file in the read-only root must be
+    // denied. This is the unambiguous WriteFile assertion — the file is already
+    // there, so denial cannot be attributed to a missing `MakeReg`, which is
+    // what a create-only probe would actually be testing.
     script.push_str(&format!(
         "if echo bad > {} 2>/dev/null; then \
-            echo 'FAIL: extra read-only root should have denied WriteFile' >&2; \
+            echo 'FAIL: extra read-only root should have denied WriteFile on an existing file' >&2; \
+            exit 1; \
+         fi\n",
+        ro_file.display(),
+    ));
+
+    // Negative: creating a new file in the read-only root must also be denied.
+    script.push_str(&format!(
+        "if echo bad > {} 2>/dev/null; then \
+            echo 'FAIL: extra read-only root should have denied file creation' >&2; \
             exit 1; \
          fi\n",
         ro_write_target.display(),
@@ -535,4 +612,122 @@ fn landlock_with_roots_grants_extra_allowed_root_access() {
         !ro_write_target.exists(),
         "sandboxed child must NOT have been able to create a file in the read-only extra root",
     );
+    assert_eq!(
+        std::fs::read_to_string(&ro_file).expect("parent must read the read-only root's file"),
+        "seed",
+        "sandboxed child must NOT have been able to overwrite an existing file \
+         in the read-only extra root",
+    );
+
+    let _ = std::fs::remove_dir_all(&extra_rw);
+    let _ = std::fs::remove_dir_all(&extra_ro);
+}
+
+/// The write-only tier must support actually delivering a file — creating a new
+/// one and writing an existing one — while never permitting reads.
+///
+/// The previous coverage supplied only read-write and read-only roots, so
+/// `allowed_roots_write_only` reached the spawned-process boundary untested and
+/// its advertised behavior rested on the permission bits alone.
+#[test]
+fn landlock_write_only_root_allows_delivery_without_read() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let extra_wo = outside_root("wo");
+
+    let existing = extra_wo.join("existing.txt");
+    let created = extra_wo.join("created.txt");
+    std::fs::write(&existing, "seed").expect("parent must seed write-only root content");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        Vec::new(),
+        vec![extra_wo.clone()],
+    )
+    .expect("landlock should succeed on linux with feature enabled");
+
+    // Positive: create a new file. This is the common case — delivering an
+    // output artifact into a drop directory — and needs `MakeReg` on the parent.
+    assert!(
+        run_sandboxed(&sandbox, &format!("echo created > {}", created.display())),
+        "write-only root must permit creating a new file",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&created).expect("parent must read the created file"),
+        "created\n",
+        "write-only root must have actually written the new file's content",
+    );
+
+    // Positive: overwrite an existing file.
+    assert!(
+        run_sandboxed(&sandbox, &format!("echo replaced > {}", existing.display())),
+        "write-only root must permit writing an existing file",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&existing).expect("parent must read the existing file"),
+        "replaced\n",
+        "write-only root must have actually replaced the existing file's content",
+    );
+
+    // Negative: reading must stay denied, or the tier is not write-only.
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("cat {} > /dev/null 2>/dev/null", existing.display()),
+        ),
+        "write-only root must deny ReadFile",
+    );
+
+    let _ = std::fs::remove_dir_all(&extra_wo);
+}
+
+/// Regression: an absent extra root must not disable sandboxing wholesale.
+///
+/// The extra roots are policy-generated, not operator-typed:
+/// `SecurityPolicy::for_agent` unconditionally adds `<install>/shared/skills` to
+/// the read-only tier, and fresh config initialization creates `<install>/shared`
+/// without that child. When a missing root was fatal, `build_ruleset` failed
+/// inside `wrap_command`, so the first absent path stopped *every* sandboxed
+/// command from spawning — while detection and posture still reported Landlock
+/// as active, because they only ran a minimal kernel probe.
+#[test]
+fn landlock_absent_extra_root_does_not_disable_sandbox() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let absent = workspace.path().join("generated-but-not-yet-created");
+    assert!(!absent.exists(), "the absent root must not exist");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        vec![absent],
+        Vec::new(),
+    )
+    .expect("an absent policy-generated root must not make Landlock unavailable");
+
+    // The sandbox must still spawn commands at all.
+    assert!(
+        run_sandboxed(&sandbox, "echo hello > /dev/null"),
+        "a sandboxed command must still spawn when an extra root is absent",
+    );
+
+    // Skipping the absent root must not loosen anything else: the workspace
+    // boundary still has to hold.
+    let outside = outside_root("absent_boundary");
+    let denied = outside.join("should_not_be_created.txt");
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("echo bad > {} 2>/dev/null", denied.display())
+        ),
+        "skipping an absent root must not grant access outside the workspace",
+    );
+    assert!(!denied.exists(), "the outside write must not have happened");
+
+    let _ = std::fs::remove_dir_all(&outside);
 }
