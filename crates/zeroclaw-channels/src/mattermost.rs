@@ -9,7 +9,7 @@ use tokio::sync::OnceCell;
 use tokio::{io::AsyncRead, io::AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelApprovalResponse, ChannelMessage, SendMessage};
 pub(crate) use zeroclaw_config::schema::MattermostListenMode;
 
 const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
@@ -19,6 +19,23 @@ const DISCOVERY_REFRESH: Duration = Duration::from_secs(60);
 /// Poll interval per discovery iteration. Matches the previous single-channel
 /// cadence so operators see no change in latency.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Emoji that stand for the two one-tap approval decisions. Mattermost's bare
+/// emoji names, not the `:shortcode:` spelling the API rejects.
+const APPROVAL_EMOJI_APPROVE: &str = "white_check_mark";
+const APPROVAL_EMOJI_DENY: &str = "x";
+
+/// Map a reaction emoji to the decision it stands for.
+///
+/// Anything else is a normal reaction on the prompt post — an operator giving a
+/// thumbs-up, say — and must not be read as an answer.
+fn approval_response_for_emoji(emoji: &str) -> Option<ChannelApprovalResponse> {
+    match emoji {
+        APPROVAL_EMOJI_APPROVE => Some(ChannelApprovalResponse::Approve),
+        APPROVAL_EMOJI_DENY => Some(ChannelApprovalResponse::Deny),
+        _ => None,
+    }
+}
 
 /// Application-level ping interval for the Mattermost WebSocket protocol.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -121,6 +138,29 @@ pub struct MattermostChannel {
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     /// How this channel receives inbound messages. Defaults to `Polling`.
     listen_mode: MattermostListenMode,
+    /// In-flight approval prompts, keyed by the 6-character token echoed back
+    /// in the operator's reply. The receive path resolves the matching sender;
+    /// `request_approval_attributed` owns the receiver.
+    ///
+    /// A `tokio` mutex rather than the `parking_lot` one used elsewhere in this
+    /// file: the receive path holds it across an `.await`.
+    pending_approvals: Arc<
+        tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>,
+    >,
+    /// Maps the prompt post's ID to the token in `pending_approvals`, so a
+    /// reaction on that post resolves the right request.
+    ///
+    /// A separate map rather than a second copy of the sender: a
+    /// `oneshot::Sender` cannot be cloned, and duplicating it would give the
+    /// reply path and the reaction path two independent chances to answer the
+    /// same prompt. `pending_approvals` stays the single owner of the decision;
+    /// this only translates a post ID into its token.
+    ///
+    /// Only populated in `Websocket` listen mode — see `request_approval_attributed`.
+    approval_posts: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// Seconds to wait for an operator reply before the runtime denies on its
+    /// own authority. Mirrors `[channels.mattermost.<alias>].approval_timeout_secs`.
+    approval_timeout_secs: u64,
 }
 
 impl MattermostChannel {
@@ -156,7 +196,22 @@ impl MattermostChannel {
             transcription: None,
             transcription_manager: None,
             listen_mode: MattermostListenMode::default(),
+            pending_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            approval_posts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            // Sourced from the config type so the in-Rust default cannot drift
+            // from the serde one. `0` here would be an already-elapsed
+            // deadline that denies every approval.
+            approval_timeout_secs: zeroclaw_config::schema::MattermostConfig::default()
+                .approval_timeout_secs,
         }
+    }
+
+    /// Seconds to wait for an operator reply to an approval prompt before the
+    /// runtime denies on its own authority.
+    #[must_use]
+    pub fn with_approval_timeout_secs(mut self, approval_timeout_secs: u64) -> Self {
+        self.approval_timeout_secs = approval_timeout_secs;
+        self
     }
 
     /// Restrict auto-discovery to the given team IDs. Empty = all teams the
@@ -667,41 +722,13 @@ impl MattermostChannel {
             }
         }
     }
-}
 
-impl ::zeroclaw_api::attribution::Attributable for MattermostChannel {
-    fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        ::zeroclaw_api::attribution::Role::Channel(
-            ::zeroclaw_api::attribution::ChannelKind::Mattermost,
-        )
-    }
-    fn alias(&self) -> &str {
-        &self.alias
-    }
-}
-
-#[async_trait]
-impl Channel for MattermostChannel {
-    fn name(&self) -> &str {
-        "mattermost"
-    }
-
-    fn self_handle(&self) -> Option<String> {
-        self.bot_identity
-            .get()
-            .map(|(id, _)| id.clone())
-            .filter(|id| !id.is_empty())
-    }
-
-    fn self_addressed_mention(&self) -> Option<String> {
-        self.bot_identity
-            .get()
-            .map(|(_, username)| username.clone())
-            .filter(|u| !u.is_empty())
-            .map(|u| format!("@{u}"))
-    }
-
-    async fn send(&self, message: &SendMessage) -> Result<()> {
+    /// Create a post and return its ID.
+    ///
+    /// `send` discards the ID; the approval path needs it, because a reaction
+    /// event identifies the post it landed on and nothing else. Kept as one
+    /// method so both paths build the request body identically.
+    async fn create_post(&self, message: &SendMessage) -> Result<String> {
         // Mattermost supports threading via 'root_id'.
         // We pack 'channel_id:root_id' into recipient if it's a thread.
         let (channel_id, root_id) = if let Some((c, r)) = message.recipient.split_once(':') {
@@ -742,7 +769,89 @@ impl Channel for MattermostChannel {
             bail!("post failed ({status}): {body}");
         }
 
+        // A post that succeeded but whose ID we cannot read is not an error for
+        // `send`, which ignores it. Return an empty ID rather than failing the
+        // send; the approval path treats an empty ID as "no reaction path".
+        Ok(resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| {
+                body.get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default())
+    }
+
+    /// React to a post as the bot.
+    ///
+    /// `emoji_name` is Mattermost's bare name (`white_check_mark`), not the
+    /// `:shortcode:` spelling.
+    async fn react_to_post(&self, post_id: &str, emoji_name: &str) -> Result<()> {
+        let (bot_user_id, _) = self.get_bot_identity().await;
+        if bot_user_id.is_empty() {
+            bail!("cannot react without a bot user ID");
+        }
+        let token = self.token().await?;
+        let resp = self
+            .http_client()
+            .post(format!("{}/api/v4/reactions", self.base_url))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "user_id": bot_user_id,
+                "post_id": post_id,
+                "emoji_name": emoji_name,
+            }))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
+            bail!("reaction failed ({status}): {body}");
+        }
         Ok(())
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MattermostChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Mattermost,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[async_trait]
+impl Channel for MattermostChannel {
+    fn name(&self) -> &str {
+        "mattermost"
+    }
+
+    fn self_handle(&self) -> Option<String> {
+        self.bot_identity
+            .get()
+            .map(|(id, _)| id.clone())
+            .filter(|id| !id.is_empty())
+    }
+
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.bot_identity
+            .get()
+            .map(|(_, username)| username.clone())
+            .filter(|u| !u.is_empty())
+            .map(|u| format!("@{u}"))
+    }
+
+    async fn send(&self, message: &SendMessage) -> Result<()> {
+        self.create_post(message).await.map(|_| ())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -822,6 +931,96 @@ impl Channel for MattermostChannel {
             handle.abort();
         }
         Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    /// Prompt the operator by posting a token-prefixed message and waiting for
+    /// a reply that echoes the token.
+    ///
+    /// Mattermost's interactive buttons post to an integration URL, which a
+    /// polling deployment has no endpoint for, so the prompt is the shared
+    /// text form used by Signal and Discord's plaintext fallback and is parsed
+    /// by the shared [`crate::util::parse_approval_reply`].
+    ///
+    /// Only a real token echo counts as an operator decision. The dropped-sender
+    /// and timeout arms are the runtime denying on its own authority and are
+    /// attributed as such, so the model is never told a human refused when none
+    /// was asked.
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        let token = crate::util::new_approval_token();
+        let text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(token.clone(), tx);
+
+        let post_id = match self.create_post(&SendMessage::new(text, recipient)).await {
+            Ok(post_id) => post_id,
+            Err(err) => {
+                self.pending_approvals.lock().await.remove(&token);
+                return Err(err);
+            }
+        };
+
+        // Offer the one-tap path only when we would actually see the tap.
+        // Reactions reach us as `reaction_added` WebSocket events; the polling
+        // listener reads posts and never sees them, so seeding the emoji there
+        // would put two buttons on the prompt that silently do nothing.
+        if self.listen_mode == zeroclaw_config::schema::MattermostListenMode::Websocket
+            && !post_id.is_empty()
+        {
+            self.approval_posts
+                .lock()
+                .await
+                .insert(post_id.clone(), token.clone());
+            self.seed_approval_reactions(&post_id).await;
+        }
+
+        let attributed =
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+                Ok(Ok(response)) => {
+                    // The resolving path already removed the token; drop the
+                    // post mapping so a later reaction on the same post cannot
+                    // find a stale entry.
+                    self.approval_posts.lock().await.remove(&post_id);
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                }
+                Ok(Err(_)) => {
+                    self.retire_approval(&token, &post_id).await;
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    )
+                }
+                Err(_) => {
+                    self.retire_approval(&token, &post_id).await;
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    )
+                }
+            };
+        Ok(Some(attributed))
     }
 }
 
@@ -1100,8 +1299,15 @@ impl MattermostChannel {
                         }
                     };
 
-                    if event.get("event").and_then(|value| value.as_str()) != Some("posted") {
-                        continue;
+                    match event.get("event").and_then(|value| value.as_str()) {
+                        Some("posted") => {}
+                        // One-tap approvals. Reactions are never routed to the
+                        // model, so this arm is terminal either way.
+                        Some("reaction_added") => {
+                            self.try_resolve_approval_reaction(&event).await;
+                            continue;
+                        }
+                        _ => continue,
                     }
 
                     let Some(post) = Self::ws_post_from_event(&event) else {
@@ -1166,6 +1372,18 @@ impl MattermostChannel {
             None
         };
 
+        // Approval replies are consumed here, before the normal message path.
+        //
+        // They must be intercepted ahead of `parse_mattermost_post` because
+        // that function applies `mention_only`, and an operator answering
+        // `abc123 yes` in a team channel has no reason to @-mention the bot.
+        // The allowlist is re-checked explicitly rather than inherited, since
+        // skipping the parse also skips its authorization gate — approving a
+        // tool call is at least as privileged as sending a message.
+        if self.try_resolve_approval_reply(post).await {
+            return false;
+        }
+
         let Some(message) = self.parse_mattermost_post(
             post,
             bot_user_id,
@@ -1179,6 +1397,167 @@ impl MattermostChannel {
         };
 
         tx.send(message).await.is_err()
+    }
+
+    /// Put the two decision emoji on the prompt post so the operator can tap
+    /// one instead of typing the token back.
+    ///
+    /// Best-effort: a failure here leaves the text path, which is the
+    /// authoritative one, completely intact. Failing the approval request
+    /// because an emoji could not be placed would deny a tool call over a
+    /// cosmetic problem, so this only warns.
+    ///
+    /// Deliberately two emoji, not three. `always` is also accepted by the text
+    /// path, but it grants a session-scoped allowlist entry rather than
+    /// permitting one call, and a mis-tap next to `approve` is far too cheap a
+    /// way to widen that. Escalating to `always` stays a typed decision.
+    async fn seed_approval_reactions(&self, post_id: &str) {
+        for emoji in [APPROVAL_EMOJI_APPROVE, APPROVAL_EMOJI_DENY] {
+            if let Err(error) = self.react_to_post(post_id, emoji).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "alias": self.alias,
+                            "post_id": post_id,
+                            "emoji": emoji,
+                            "error": error.to_string(),
+                        })),
+                    "failed to seed Mattermost approval reaction; the text reply path still works"
+                );
+            }
+        }
+    }
+
+    /// Drop both handles on a prompt the runtime is about to answer itself.
+    ///
+    /// Leaving either behind would let a late reply or a late tap resolve a
+    /// prompt whose caller has already been told the answer.
+    async fn retire_approval(&self, token: &str, post_id: &str) {
+        self.pending_approvals.lock().await.remove(token);
+        self.approval_posts.lock().await.remove(post_id);
+    }
+
+    /// Decode a `reaction_added` event's payload. Mattermost sends the reaction
+    /// as a JSON *string* under `data.reaction`, the same shape as `data.post`.
+    fn ws_reaction_from_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+        let reaction = event.get("data")?.get("reaction")?.as_str()?;
+        serde_json::from_str(reaction).ok()
+    }
+
+    /// Resolve a pending approval from a reaction on its prompt post.
+    ///
+    /// Returns `true` when the reaction was consumed as a decision. Unlike the
+    /// reply path there is nothing to keep away from the model — a reaction is
+    /// never routed as a message — so the return value exists for tests and
+    /// logging rather than for control flow.
+    async fn try_resolve_approval_reaction(&self, event: &serde_json::Value) -> bool {
+        let Some(reaction) = Self::ws_reaction_from_event(event) else {
+            return false;
+        };
+        let emoji = reaction
+            .get("emoji_name")
+            .and_then(|emoji| emoji.as_str())
+            .unwrap_or("");
+        let Some(response) = approval_response_for_emoji(emoji) else {
+            return false;
+        };
+        let post_id = reaction
+            .get("post_id")
+            .and_then(|post| post.as_str())
+            .unwrap_or("");
+
+        // Cheap check first: a reaction on any other post is not ours, and
+        // rejecting it here keeps unrelated chatter out of the auth logs.
+        let Some(token) = self.approval_posts.lock().await.get(post_id).cloned() else {
+            return false;
+        };
+
+        let user_id = reaction
+            .get("user_id")
+            .and_then(|user| user.as_str())
+            .unwrap_or("");
+
+        // The bot seeds both emoji itself, so its own reactions come straight
+        // back as events. Answering them would auto-approve every prompt the
+        // instant it is posted.
+        let (bot_user_id, _) = self.get_bot_identity().await;
+        if !bot_user_id.is_empty() && user_id == bot_user_id {
+            return false;
+        }
+
+        if !self.is_user_allowed(user_id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "user_id": user_id,
+                        "token": token,
+                        "emoji": emoji,
+                    })),
+                "ignoring approval reaction from unauthorized user"
+            );
+            // Leave the prompt pending so an authorized operator can still
+            // answer it, by reaction or by reply.
+            return false;
+        }
+
+        let Some(sender) = self.pending_approvals.lock().await.remove(&token) else {
+            return false;
+        };
+        self.approval_posts.lock().await.remove(post_id);
+        // A closed receiver means the waiter already timed out; the decision is
+        // simply dropped.
+        let _ = sender.send(response);
+        true
+    }
+
+    /// Consume `post` if it is an authorized reply to a pending approval
+    /// prompt. Returns `true` when the post was consumed, so the caller skips
+    /// the normal message path and the reply never reaches the model.
+    async fn try_resolve_approval_reply(&self, post: &serde_json::Value) -> bool {
+        let text = post
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("");
+        let Some((token, response)) = crate::util::parse_approval_reply(text) else {
+            return false;
+        };
+
+        // Cheap check first: an unrecognized token is not ours, and rejecting
+        // it here avoids logging an authorization failure for text that merely
+        // resembles an approval reply.
+        if !self.pending_approvals.lock().await.contains_key(&token) {
+            return false;
+        }
+
+        let user_id = post
+            .get("user_id")
+            .and_then(|user| user.as_str())
+            .unwrap_or("");
+        if !self.is_user_allowed(user_id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"user_id": user_id, "token": token})),
+                "ignoring approval reply from unauthorized user"
+            );
+            // Consume it regardless: the text is an approval reply, not a
+            // message for the model, and leaving the prompt pending lets an
+            // authorized operator still answer it.
+            return true;
+        }
+
+        let Some(sender) = self.pending_approvals.lock().await.remove(&token) else {
+            return false;
+        };
+        // A closed receiver means the waiter already gave up (timed out); the
+        // decision is simply dropped, and the reply is still consumed.
+        let _ = sender.send(response);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3495,5 +3874,383 @@ mod tests {
             () = std::future::pending::<()>() => panic!("silent peer unexpectedly produced a frame"),
             () = tokio::time::sleep_until(deadline) => {}
         }
+    }
+}
+
+/// Approval-prompt routing. Mattermost previously inherited the `Channel`
+/// trait's default `request_approval`, which returns `Ok(None)` meaning "this
+/// channel does not implement the prompt at all" — the runtime then denied
+/// every gated tool call with `ApprovalSource::Unavailable`, and the operator
+/// was never asked.
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ALLOWED_USER: &str = "operator_user_id";
+
+    fn channel_with_peers(peers: Vec<String>) -> MattermostChannel {
+        MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_test_alias",
+            Arc::new(move || peers.clone()),
+            false,
+            false,
+        )
+    }
+
+    fn post_from(user_id: &str, message: &str) -> serde_json::Value {
+        json!({"id": "post1", "user_id": user_id, "message": message, "create_at": 1})
+    }
+
+    /// A `reaction_added` WebSocket event. Mattermost sends the reaction as a
+    /// JSON *string* under `data.reaction`, so the fixture encodes it the same
+    /// way the server does — a plain object here would pass a test that the
+    /// real event shape fails.
+    fn reaction_event(user_id: &str, post_id: &str, emoji_name: &str) -> serde_json::Value {
+        json!({
+            "event": "reaction_added",
+            "data": {
+                "reaction": json!({
+                    "user_id": user_id,
+                    "post_id": post_id,
+                    "emoji_name": emoji_name,
+                    "create_at": 1,
+                })
+                .to_string(),
+            },
+        })
+    }
+
+    /// Register a pending approval reachable by both paths, as
+    /// `request_approval_attributed` does in Websocket mode.
+    async fn pending_with_post(
+        ch: &MattermostChannel,
+        token: &str,
+        post_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert(token.to_string(), tx);
+        ch.approval_posts
+            .lock()
+            .await
+            .insert(post_id.to_string(), token.to_string());
+        rx
+    }
+
+    /// The point of the feature: a tap on the seeded checkmark answers the
+    /// prompt without the operator typing the token back.
+    #[tokio::test]
+    async fn authorized_reaction_resolves_pending_approval() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let rx = pending_with_post(&ch, "abc123", "prompt_post").await;
+
+        let consumed = ch
+            .try_resolve_approval_reaction(&reaction_event(
+                ALLOWED_USER,
+                "prompt_post",
+                APPROVAL_EMOJI_APPROVE,
+            ))
+            .await;
+
+        assert!(consumed, "a decision reaction must resolve the prompt");
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            ch.pending_approvals.lock().await.is_empty(),
+            "resolving must retire the pending token"
+        );
+        assert!(
+            ch.approval_posts.lock().await.is_empty(),
+            "resolving must retire the post mapping so a later tap finds nothing"
+        );
+    }
+
+    /// The deny emoji must mean deny — not merely "something was tapped".
+    #[tokio::test]
+    async fn deny_reaction_resolves_as_deny() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let rx = pending_with_post(&ch, "abc123", "prompt_post").await;
+
+        assert!(
+            ch.try_resolve_approval_reaction(&reaction_event(
+                ALLOWED_USER,
+                "prompt_post",
+                APPROVAL_EMOJI_DENY,
+            ))
+            .await
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+    }
+
+    /// Reacting is as privileged as replying, so the same allowlist applies.
+    /// The prompt must stay pending: an unauthorized tap cannot consume the
+    /// decision an authorized operator has not made yet.
+    #[tokio::test]
+    async fn unauthorized_reaction_cannot_approve() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let mut rx = pending_with_post(&ch, "abc123", "prompt_post").await;
+
+        let consumed = ch
+            .try_resolve_approval_reaction(&reaction_event(
+                "intruder_user_id",
+                "prompt_post",
+                APPROVAL_EMOJI_APPROVE,
+            ))
+            .await;
+
+        assert!(
+            !consumed,
+            "an unauthorized tap must not count as a decision"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an unauthorized tap must not deliver a response"
+        );
+        assert!(
+            !ch.pending_approvals.lock().await.is_empty(),
+            "the prompt must stay answerable by an authorized operator"
+        );
+    }
+
+    /// Regression: the bot seeds both emoji itself, so its own reactions arrive
+    /// as events on the post it just created. Treating those as decisions would
+    /// approve every prompt the instant it was posted.
+    #[tokio::test]
+    async fn bot_own_seeded_reaction_is_ignored() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let mut rx = pending_with_post(&ch, "abc123", "prompt_post").await;
+        // `get_bot_identity` caches; seed it so the test makes no HTTP call.
+        let _ = ch
+            .bot_identity
+            .set(("bot_user_id".to_string(), "glados".to_string()));
+
+        let consumed = ch
+            .try_resolve_approval_reaction(&reaction_event(
+                "bot_user_id",
+                "prompt_post",
+                APPROVAL_EMOJI_APPROVE,
+            ))
+            .await;
+
+        assert!(
+            !consumed,
+            "the bot's own seeded emoji must not self-approve"
+        );
+        assert!(rx.try_recv().is_err(), "no response must be delivered");
+        assert!(
+            !ch.pending_approvals.lock().await.is_empty(),
+            "the prompt must stay pending"
+        );
+    }
+
+    /// An ordinary reaction on the prompt post is not an answer. Only the two
+    /// decision emoji are.
+    #[tokio::test]
+    async fn unrelated_emoji_is_not_a_decision() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let mut rx = pending_with_post(&ch, "abc123", "prompt_post").await;
+
+        assert!(
+            !ch.try_resolve_approval_reaction(&reaction_event(
+                ALLOWED_USER,
+                "prompt_post",
+                "thumbsup",
+            ))
+            .await
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!ch.pending_approvals.lock().await.is_empty());
+    }
+
+    /// A decision emoji on some other post must not resolve a live prompt.
+    #[tokio::test]
+    async fn reaction_on_unrelated_post_is_ignored() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let mut rx = pending_with_post(&ch, "abc123", "prompt_post").await;
+
+        assert!(
+            !ch.try_resolve_approval_reaction(&reaction_event(
+                ALLOWED_USER,
+                "some_other_post",
+                APPROVAL_EMOJI_APPROVE,
+            ))
+            .await
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!ch.pending_approvals.lock().await.is_empty());
+    }
+
+    /// The two paths share one decision. Whichever answers first retires the
+    /// token, and the other must find nothing left to answer.
+    #[tokio::test]
+    async fn reply_and_reaction_cannot_both_answer_one_prompt() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let rx = pending_with_post(&ch, "abc123", "prompt_post").await;
+
+        assert!(
+            ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"))
+                .await
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+
+        // The reaction arrives afterwards — the operator tapped as well as typed.
+        assert!(
+            !ch.try_resolve_approval_reaction(&reaction_event(
+                ALLOWED_USER,
+                "prompt_post",
+                APPROVAL_EMOJI_DENY,
+            ))
+            .await,
+            "a second answer must not resolve an already-retired prompt"
+        );
+    }
+
+    /// A token echo from an allow-listed operator resolves the waiting prompt
+    /// and is consumed, so the bare `token yes` never reaches the model.
+    #[tokio::test]
+    async fn authorized_reply_resolves_pending_approval() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc123".to_string(), tx);
+
+        let consumed = ch
+            .try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"))
+            .await;
+
+        assert!(
+            consumed,
+            "an approval reply must not fall through to the model"
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            ch.pending_approvals.lock().await.is_empty(),
+            "resolving must retire the pending token"
+        );
+    }
+
+    /// Approving a tool call is at least as privileged as sending a message,
+    /// so the allowlist is re-checked on the approval path.
+    #[tokio::test]
+    async fn unauthorized_reply_cannot_approve() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc123".to_string(), tx);
+
+        let consumed = ch
+            .try_resolve_approval_reply(&post_from("intruder_user_id", "abc123 yes"))
+            .await;
+
+        assert!(
+            consumed,
+            "the reply is protocol text, not a message for the model"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an unauthorized reply must not decide the approval"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.contains_key("abc123"),
+            "the prompt must stay pending so an authorized operator can still answer"
+        );
+    }
+
+    /// A well-formed reply for a token this channel never issued belongs to
+    /// someone else (or nobody) and must reach the normal message path.
+    #[tokio::test]
+    async fn unknown_token_is_not_consumed() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        assert!(
+            !ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "zzz999 yes"))
+                .await
+        );
+    }
+
+    /// Ordinary conversation must never be swallowed by the approval path.
+    #[tokio::test]
+    async fn ordinary_message_is_not_consumed() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc123".to_string(), tx);
+
+        assert!(
+            !ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "what is the weather"))
+                .await
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+    }
+
+    /// `deny` and `always` must map to their own outcomes rather than
+    /// collapsing into the generic approve/deny pair.
+    #[tokio::test]
+    async fn deny_and_always_map_to_distinct_responses() {
+        for (reply, expected) in [
+            ("abc123 no", ChannelApprovalResponse::Deny),
+            ("abc123 always", ChannelApprovalResponse::AlwaysApprove),
+        ] {
+            let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ch.pending_approvals
+                .lock()
+                .await
+                .insert("abc123".to_string(), tx);
+            assert!(
+                ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, reply))
+                    .await
+            );
+            assert_eq!(rx.await.unwrap(), expected);
+        }
+    }
+
+    /// A zero timeout is an already-elapsed deadline. The config default must
+    /// therefore be the documented budget, not the zero a derived `Default`
+    /// would produce — otherwise an alias built in Rust denies every approval.
+    #[test]
+    fn constructor_default_timeout_is_not_zero() {
+        let ch = channel_with_peers(Vec::new());
+        assert_eq!(
+            ch.approval_timeout_secs,
+            zeroclaw_config::schema::MattermostConfig::default().approval_timeout_secs,
+        );
+        assert!(ch.approval_timeout_secs > 0);
+    }
+
+    /// The runtime denies on its own authority when nobody answers, and must
+    /// attribute that to the timeout rather than to the operator.
+    #[tokio::test]
+    async fn timeout_denies_attributed_to_runtime_not_operator() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]).with_approval_timeout_secs(0);
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "rm -rf /".into(),
+            raw_arguments: None,
+        };
+
+        // `send` fails against the unreachable test host, which surfaces as an
+        // Err rather than a synthesized operator decision.
+        let result = ch.request_approval_attributed("chan1", &request).await;
+        assert!(
+            result.is_err(),
+            "a failed prompt post must not be reported as an operator decision"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.is_empty(),
+            "a failed prompt must not leak its pending token"
+        );
     }
 }
