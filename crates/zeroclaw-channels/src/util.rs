@@ -401,6 +401,7 @@ pub(crate) fn format_location_content(lat: f64, lng: f64, name: Option<&str>) ->
 
 #[cfg(any(
     feature = "channel-discord",
+    feature = "channel-mattermost",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-whatsapp-cloud",
@@ -456,6 +457,7 @@ pub fn parse_approval_reply(
 /// switch cannot desync the prompt from [`parse_approval_reply`].
 #[cfg(any(
     feature = "channel-discord",
+    feature = "channel-mattermost",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-whatsapp-cloud",
