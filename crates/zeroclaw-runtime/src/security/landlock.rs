@@ -365,44 +365,73 @@ impl LandlockSandbox {
                     continue;
                 }
 
-                // Unlike the workspace above, an absent root here is skipped rather than
-                // fatal. These roots are policy-generated, not operator-typed, and the
-                // policy emits them before anything creates them: `SecurityPolicy::for_agent`
-                // unconditionally pushes `<install>/shared/skills` into the read-only tier
-                // while fresh config initialization creates `<install>/shared` without that
-                // child, and a cross-agent grant can name a sibling workspace that its own
-                // agent has not materialized yet.
+                // Unlike the workspace above, a root here that cannot be opened
+                // is skipped rather than fatal — whatever the reason. These roots
+                // are policy-generated, not operator-typed: `SecurityPolicy::for_agent`
+                // unconditionally pushes `<install>/shared/skills` into the read-only
+                // tier while fresh config initialization creates `<install>/shared`
+                // without that child, and a cross-agent grant can name a sibling
+                // workspace that its own agent has not materialized yet.
                 //
-                // Failing closed on those is not a safe default but a total outage: the
-                // error surfaces from `build_ruleset` inside `wrap_command`, so the *first*
-                // absent root stops every sandboxed command from spawning at all — not just
-                // access to the missing path. Skipping keeps the kernel boundary strictly
-                // tighter than policy, which is the safe direction, and the omission is
-                // recorded at DEBUG so it stays diagnosable.
+                // Failing closed on any of them is not a safe default but a
+                // security downgrade. The error propagates out of `build_ruleset`
+                // to `with_roots`, and `create_selected_sandbox` discards that Err
+                // (`security/detect.rs`), so the factory hands back `NoopSandbox`:
+                // one malformed optional root — `/dev/null/not-a-child` returns
+                // `ENOTDIR`, not `ENOENT` — would strip kernel enforcement from the
+                // valid workspace and every other valid root along with it. Inside
+                // `wrap_command` it is worse still: the first bad root stops every
+                // sandboxed command from spawning at all.
+                //
+                // Skipping can only ever *remove* a grant, so it is always the
+                // strictly-tighter direction, and the omission is recorded so it
+                // stays diagnosable: DEBUG for an absent path, which is routine
+                // during first-run initialization, WARN for anything else, which
+                // means a root is configured that this host cannot open.
+                //
+                // The primary workspace stays fail-closed: without it there is no
+                // boundary left to keep tighter.
                 match PathFd::new(root) {
                     Ok(root_fd) => {
                         ruleset = ruleset
                             .add_rule(PathBeneath::new(root_fd, perm))
                             .map_err(|e| std::io::Error::other(e.to_string()))?;
                     }
-                    Err(PathFdError::OpenCall { source, .. })
-                        if source.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({
-                                "root": root.display().to_string(),
-                                "tier": tier,
-                            })),
-                            "Skipping absent allowed root in Landlock ruleset"
-                        );
-                    }
                     Err(e) => {
-                        return Err(std::io::Error::other(e.to_string()));
+                        let absent = matches!(
+                            &e,
+                            PathFdError::OpenCall { source, .. }
+                                if source.kind() == std::io::ErrorKind::NotFound
+                        );
+                        if absent {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "root": root.display().to_string(),
+                                    "tier": tier,
+                                })),
+                                "Skipping absent allowed root in Landlock ruleset"
+                            );
+                        } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "root": root.display().to_string(),
+                                    "tier": tier,
+                                    "error": e.to_string(),
+                                })),
+                                "Skipping unopenable allowed root in Landlock ruleset: \
+                                 the rest of the ruleset is still enforced"
+                            );
+                        }
                     }
                 }
             }

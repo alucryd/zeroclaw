@@ -33,7 +33,19 @@ pub struct SandboxPosture {
     pub fallback: bool,
 }
 
-/// Inspect sandbox backend selection without constructing a sandbox instance.
+/// Inspect sandbox backend selection without returning a usable sandbox.
+///
+/// This does not enforce anything, but on Linux it is **not** a minimal or
+/// side-effect-free probe: `landlock_available` reaches
+/// `LandlockSandbox::with_roots`, which builds the full ruleset execution will
+/// use — opening every configured path and emitting the same DEBUG/WARN
+/// diagnostics for absent, unopenable, or unenforceable roots. That is
+/// deliberate. Deciding availability from a cheaper probe is what let posture
+/// report a backend as active while every subsequent spawn failed; validating
+/// through the real construction keeps the two answers in step.
+///
+/// The ruleset is dropped without `restrict_self`, so the calling process is
+/// never confined.
 #[must_use]
 pub fn sandbox_posture(
     sandbox: &SandboxConfig,

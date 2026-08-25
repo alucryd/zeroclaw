@@ -1090,3 +1090,66 @@ fn landlock_root_in_both_restrictive_tiers_composes() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Regression: an extra root that cannot be opened for *any* reason must not
+/// disable the whole sandbox.
+///
+/// `landlock_absent_extra_root_does_not_disable_sandbox` covers `ENOENT`. This
+/// covers everything else: a path beneath a non-directory (`/dev/null/not-a-child`)
+/// fails `PathFd::new` with `ENOTDIR`, which an earlier revision propagated out
+/// of `build_ruleset`. `create_selected_sandbox` discards that error, so the
+/// factory returned `NoopSandbox` — one malformed optional root stripped kernel
+/// enforcement from the valid workspace and every other valid root.
+///
+/// The assertion is therefore not merely that construction succeeds, but that
+/// the child is still confined: it can write inside the workspace and cannot
+/// write outside it.
+#[test]
+fn landlock_unopenable_extra_root_does_not_disable_sandbox() {
+    let _serialized = serialize_test();
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+
+    // Beneath a non-directory: open(2) fails with ENOTDIR, not ENOENT.
+    let invalid = PathBuf::from("/dev/null/not-a-child");
+    let dev_null = Path::new("/dev/null");
+    assert!(
+        dev_null.exists() && !dev_null.is_dir(),
+        "the probe relies on /dev/null existing as a non-directory",
+    );
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        Vec::new(),
+        vec![invalid.clone()],
+        vec![invalid],
+    )
+    .expect("an unopenable extra root must not make Landlock unavailable");
+
+    // The workspace rule must still be installed and enforced.
+    let inside = workspace.path().join("inside.txt");
+    assert!(
+        run_sandboxed(&sandbox, &format!("echo ok > {}", inside.display())),
+        "the workspace must still be writable when an extra root could not be opened",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&inside).expect("parent must read the workspace file"),
+        "ok\n",
+    );
+
+    // And the child must still be confined — this is what fails if the sandbox
+    // silently degraded to a no-op.
+    let outside = outside_root("unopenable_boundary");
+    let denied = outside.join("should_not_be_created.txt");
+    assert!(
+        !run_sandboxed(
+            &sandbox,
+            &format!("echo bad > {} 2>/dev/null", denied.display())
+        ),
+        "an unopenable extra root must not drop the child out of the sandbox",
+    );
+    assert!(!denied.exists(), "the outside write must not have happened");
+
+    let _ = std::fs::remove_dir_all(&outside);
+}
