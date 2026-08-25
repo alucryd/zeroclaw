@@ -52,6 +52,11 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
+    "transcription.openai",
+    "transcription.deepgram",
+    "transcription.assemblyai",
+    "transcription.google",
+    "transcription.local_whisper",
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
@@ -20282,7 +20287,7 @@ impl Config {
             (true, true) => "http_request and web_fetch",
             (true, false) => "http_request",
             (false, true) => "web_fetch",
-            (false, false) => unreachable!(),
+            (false, false) => return,
         };
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "proxy_conflicts_with_dns_pinned_tools",
@@ -22613,31 +22618,40 @@ impl Config {
             );
         }
 
-        // The granted egress allowlist is a security control, so a
-        // malformed entry is a hard config error rather than a silently
-        // dropped line. Both lists validate against the one shared strict
-        // grammar in `zeroclaw_infra::net_guard`.
+        // The granted egress allowlist is a security control, so a malformed
+        // entry is a hard config error rather than a silently dropped line.
+        // Both lists validate against the one shared strict grammar in
+        // `zeroclaw_infra::net_guard`, including containment of the private
+        // address carveout by the host grant.
         for entry in &self.plugins.entries {
-            for (field, patterns) in [
-                ("egress_hosts", &entry.egress_hosts),
-                ("egress_allow_private", &entry.egress_allow_private),
-            ] {
-                let path = format!("plugins.entries.{}.{field}", entry.name);
-                if let Err(e) =
-                    zeroclaw_infra::net_guard::normalize_egress_patterns(patterns, &path)
-                {
-                    validation_bail!(InvalidFormat, path.clone(), "{}", e);
+            let hosts = {
+                let path = format!("plugins.entries.{}.egress_hosts", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_hosts,
+                    &path,
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
                 }
-            }
+            };
+            let private = {
+                let path = format!("plugins.entries.{}.egress_allow_private", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_allow_private,
+                    &path,
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
+                }
+            };
 
             // A carveout for a host that was never granted is almost always a
             // typo, and silently ignoring it leaves an operator believing they
             // opened a path they did not.
-            for private in &entry.egress_allow_private {
-                if !zeroclaw_infra::net_guard::egress_host_matches(
-                    private.trim_start_matches("*."),
-                    &entry.egress_hosts,
-                ) && !entry.egress_hosts.iter().any(|h| h == private)
+            for private in &private {
+                if !hosts
+                    .iter()
+                    .any(|grant| zeroclaw_infra::net_guard::egress_pattern_contains(grant, private))
                 {
                     validation_bail!(
                         InvalidFormat,
@@ -26205,6 +26219,19 @@ enabled = true
     }
 
     #[test]
+    async fn validate_accepts_canonical_equivalent_ipv6_and_wildcard_carveouts() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["[::1]", "*.example.com"],
+            &["[::1]", "*.sub.example.com"],
+        ));
+
+        config
+            .validate()
+            .expect("equivalent IPv6 and narrower wildcard grants must validate");
+    }
+
+    #[test]
     async fn validate_rejects_an_allow_all_egress_entry() {
         let mut config = Config::default();
         config
@@ -26257,6 +26284,21 @@ enabled = true
             text.contains("egress_allow_private"),
             "error must name the offending path; got: {text}"
         );
+        assert!(text.contains("not granted by egress_hosts"), "got: {text}");
+    }
+
+    #[test]
+    async fn validate_rejects_a_wildcard_carveout_for_an_exact_apex_grant() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["example.com"],
+            &["*.example.com"],
+        ));
+        let err = config
+            .validate()
+            .expect_err("a wildcard carveout must not widen an exact grant");
+        let text = err.to_string();
+        assert!(text.contains("egress_allow_private"), "got: {text}");
         assert!(text.contains("not granted by egress_hosts"), "got: {text}");
     }
 
@@ -32160,6 +32202,32 @@ api_token = "tok"
 
         let error = proxy.validate().unwrap_err().to_string();
         assert!(error.contains("proxy.scope='services'"));
+    }
+
+    #[test]
+    async fn proxy_config_accepts_transcription_service_selectors() {
+        let mut proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            ..ProxyConfig::default()
+        };
+
+        for selector in [
+            "transcription.groq",
+            "transcription.openai",
+            "transcription.deepgram",
+            "transcription.assemblyai",
+            "transcription.google",
+            "transcription.local_whisper",
+            "transcription.*",
+        ] {
+            proxy.services = vec![selector.to_string()];
+            assert!(
+                proxy.validate().is_ok(),
+                "exact transcription selector `{selector}` should validate"
+            );
+        }
     }
 
     #[test]
