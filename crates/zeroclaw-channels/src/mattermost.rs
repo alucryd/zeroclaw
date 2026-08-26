@@ -20,6 +20,32 @@ const DISCOVERY_REFRESH: Duration = Duration::from_secs(60);
 /// cadence so operators see no change in latency.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// A prompt awaiting an answer, bound to the destination it was posted into.
+///
+/// The token alone is not enough to identify the answer. It travels in
+/// plaintext into a channel, one `MattermostChannel` serves many channels
+/// (`poll_channel` iterates targets; the WebSocket path sees every post the bot
+/// can read), and peer-group membership is scoped to the alias rather than to a
+/// room. Without the destination an authorized user could answer a prompt from a
+/// channel it was never posted to.
+struct PendingApproval {
+    /// Mattermost channel ID the prompt was posted into.
+    channel_id: String,
+    sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+}
+
+/// The channel ID half of a recipient.
+///
+/// Recipients are `channel_id` or `channel_id:root_id` for a threaded reply.
+/// Binding is on the channel, not the thread: an operator answering in the
+/// channel rather than inside the prompt's thread is still answering in the
+/// right room, and Mattermost clients make it easy to do either.
+fn recipient_channel_id(recipient: &str) -> &str {
+    recipient
+        .split_once(':')
+        .map_or(recipient, |(channel, _)| channel)
+}
+
 /// Emoji that stand for the two one-tap approval decisions. Mattermost's bare
 /// emoji names, not the `:shortcode:` spelling the API rejects.
 const APPROVAL_EMOJI_APPROVE: &str = "white_check_mark";
@@ -144,9 +170,7 @@ pub struct MattermostChannel {
     ///
     /// A `tokio` mutex rather than the `parking_lot` one used elsewhere in this
     /// file: the receive path holds it across an `.await`.
-    pending_approvals: Arc<
-        tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>,
-    >,
+    pending_approvals: Arc<tokio::sync::Mutex<HashMap<String, PendingApproval>>>,
     /// Maps the prompt post's ID to the token in `pending_approvals`, so a
     /// reaction on that post resolves the right request.
     ///
@@ -969,10 +993,13 @@ impl Channel for MattermostChannel {
         );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            PendingApproval {
+                channel_id: recipient_channel_id(recipient).to_string(),
+                sender: tx,
+            },
+        );
 
         let post_id = match self.create_post(&SendMessage::new(text, recipient)).await {
             Ok(post_id) => post_id,
@@ -1504,9 +1531,10 @@ impl MattermostChannel {
             return false;
         }
 
-        let Some(sender) = self.pending_approvals.lock().await.remove(&token) else {
+        let Some(pending) = self.pending_approvals.lock().await.remove(&token) else {
             return false;
         };
+        let sender = pending.sender;
         self.approval_posts.lock().await.remove(post_id);
         // A closed receiver means the waiter already timed out; the decision is
         // simply dropped.
@@ -1533,6 +1561,40 @@ impl MattermostChannel {
             return false;
         }
 
+        // The reply has to come from the channel the prompt went to. The token
+        // is readable by everyone who can see the prompt, and this one channel
+        // instance serves many Mattermost channels, so without this an
+        // authorized user could carry a token into a different room and answer
+        // there. Peer-group membership below is a separate, necessary condition:
+        // it says *who* may decide, not *where* the decision is valid.
+        let reply_channel = post
+            .get("channel_id")
+            .and_then(|channel| channel.as_str())
+            .unwrap_or("");
+        let origin_channel = self
+            .pending_approvals
+            .lock()
+            .await
+            .get(&token)
+            .map(|pending| pending.channel_id.clone());
+        if origin_channel.as_deref() != Some(reply_channel) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "token": token,
+                        "reply_channel": reply_channel,
+                        "origin_channel": origin_channel,
+                    })),
+                "ignoring approval reply from a channel the prompt was not posted to"
+            );
+            // Consumed, not resolved: this is approval-reply text rather than a
+            // message for the model, and the prompt stays answerable in the
+            // channel it actually belongs to.
+            return true;
+        }
+
         let user_id = post
             .get("user_id")
             .and_then(|user| user.as_str())
@@ -1551,9 +1613,10 @@ impl MattermostChannel {
             return true;
         }
 
-        let Some(sender) = self.pending_approvals.lock().await.remove(&token) else {
+        let Some(pending) = self.pending_approvals.lock().await.remove(&token) else {
             return false;
         };
+        let sender = pending.sender;
         // A closed receiver means the waiter already gave up (timed out); the
         // decision is simply dropped, and the reply is still consumed.
         let _ = sender.send(response);
@@ -3903,8 +3966,40 @@ mod approval_tests {
         )
     }
 
+    /// The channel every fixture prompt is posted into unless stated otherwise.
+    const ORIGIN_CHANNEL: &str = "chan1";
+
     fn post_from(user_id: &str, message: &str) -> serde_json::Value {
-        json!({"id": "post1", "user_id": user_id, "message": message, "create_at": 1})
+        post_from_in(ORIGIN_CHANNEL, user_id, message)
+    }
+
+    /// The same, in an explicit channel: destination binding is only testable
+    /// when the fixture can name a channel other than the prompt's.
+    fn post_from_in(channel_id: &str, user_id: &str, message: &str) -> serde_json::Value {
+        json!({
+            "id": "post1",
+            "channel_id": channel_id,
+            "user_id": user_id,
+            "message": message,
+            "create_at": 1,
+        })
+    }
+
+    /// Register a pending approval bound to `ORIGIN_CHANNEL`, as
+    /// `request_approval_attributed` does.
+    async fn pending_in_origin(
+        ch: &MattermostChannel,
+        token: &str,
+    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            token.to_string(),
+            PendingApproval {
+                channel_id: ORIGIN_CHANNEL.to_string(),
+                sender: tx,
+            },
+        );
+        rx
     }
 
     /// A `reaction_added` WebSocket event. Mattermost sends the reaction as a
@@ -3933,11 +4028,7 @@ mod approval_tests {
         token: &str,
         post_id: &str,
     ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert(token.to_string(), tx);
+        let rx = pending_in_origin(ch, token).await;
         ch.approval_posts
             .lock()
             .await
@@ -4117,11 +4208,7 @@ mod approval_tests {
     #[tokio::test]
     async fn authorized_reply_resolves_pending_approval() {
         let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
+        let rx = pending_in_origin(&ch, "abc123").await;
 
         let consumed = ch
             .try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"))
@@ -4143,11 +4230,7 @@ mod approval_tests {
     #[tokio::test]
     async fn unauthorized_reply_cannot_approve() {
         let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
+        let mut rx = pending_in_origin(&ch, "abc123").await;
 
         let consumed = ch
             .try_resolve_approval_reply(&post_from("intruder_user_id", "abc123 yes"))
@@ -4178,15 +4261,220 @@ mod approval_tests {
         );
     }
 
+    /// Regression: a token is readable by everyone who can see the prompt, and
+    /// one channel instance serves many Mattermost channels, so an authorized
+    /// user must not be able to carry a valid token into a different room and
+    /// answer there.
+    ///
+    /// Driven through `process_inbound_post`, the production inbound path, so
+    /// the binding is proven where posts actually arrive rather than only in the
+    /// resolver.
+    #[tokio::test]
+    async fn approval_reply_from_another_channel_cannot_answer() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let mut rx = pending_in_origin(&ch, "abc123").await;
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        // Same token, same authorized operator, wrong channel.
+        ch.process_inbound_post(
+            &post_from_in("chan2", ALLOWED_USER, "abc123 yes"),
+            "bot_user_id",
+            "glados",
+            0,
+            "chan2",
+            false,
+            &tx,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a reply from another channel must not deliver a decision"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.contains_key("abc123"),
+            "the prompt must stay answerable in the channel it belongs to"
+        );
+        assert!(
+            inbound.try_recv().is_err(),
+            "approval-reply text must not fall through to the model either"
+        );
+
+        // The same reply in the origin channel resolves it.
+        ch.process_inbound_post(
+            &post_from(ALLOWED_USER, "abc123 yes"),
+            "bot_user_id",
+            "glados",
+            0,
+            ORIGIN_CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    /// Build a channel pointed at a mock Mattermost server.
+    fn channel_at(base_url: &str, peers: Vec<String>) -> MattermostChannel {
+        MattermostChannel::new(
+            base_url.to_string(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_test_alias",
+            Arc::new(move || peers.clone()),
+            false,
+            false,
+        )
+    }
+
+    fn approval_request() -> zeroclaw_api::channel::ChannelApprovalRequest {
+        zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "rm -rf /".into(),
+            raw_arguments: None,
+        }
+    }
+
+    /// The real timeout regression: the prompt posts successfully, nobody
+    /// answers, and the runtime denies on its own authority.
+    ///
+    /// `approval_timeout_secs = 0` is an already-elapsed deadline, which is the
+    /// documented "0 denies immediately" semantics, so this also pins that.
+    #[tokio::test]
+    async fn timeout_after_successful_post_is_attributed_to_the_runtime() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "prompt_post"})))
+            .mount(&server)
+            .await;
+
+        let ch =
+            channel_at(&server.uri(), vec![ALLOWED_USER.to_string()]).with_approval_timeout_secs(0);
+
+        let attributed = ch
+            .request_approval_attributed(ORIGIN_CHANNEL, &approval_request())
+            .await
+            .expect("a successful post must not surface as an error")
+            .expect("Mattermost answers approvals, so it must not return None");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::TimedOut,
+            "an unanswered prompt is the runtime denying, not an operator refusing"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.is_empty(),
+            "a timed-out prompt must not leak its token"
+        );
+        assert!(
+            ch.approval_posts.lock().await.is_empty(),
+            "a timed-out prompt must not leak its post binding"
+        );
+    }
+
+    /// The prompt actually reaches Mattermost, and websocket mode actually
+    /// seeds both decision emoji. Asserted at the HTTP boundary, since
+    /// `create_post` and `react_to_post` are otherwise only exercised by their
+    /// callers' return values.
+    #[tokio::test]
+    async fn websocket_mode_posts_prompt_and_seeds_both_reactions() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "bot_user_id", "username": "glados"})),
+            )
+            .mount(&server)
+            .await;
+        // The prompt carries the token and the tool, or the operator cannot answer.
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .and(body_string_contains("APPROVAL REQUIRED"))
+            .and(body_string_contains("shell"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "prompt_post"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/reactions"))
+            .and(body_string_contains(APPROVAL_EMOJI_APPROVE))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/reactions"))
+            .and(body_string_contains(r#""emoji_name":"x""#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = channel_at(&server.uri(), vec![ALLOWED_USER.to_string()])
+            .with_listen_mode(zeroclaw_config::schema::MattermostListenMode::Websocket)
+            .with_approval_timeout_secs(0);
+
+        let _ = ch
+            .request_approval_attributed(ORIGIN_CHANNEL, &approval_request())
+            .await;
+
+        // MockServer verifies the `expect(..)` counts when it drops.
+        drop(server);
+    }
+
+    /// The mirror of the test above: polling mode must not seed emoji, because
+    /// the polling listener never receives `reaction_added` and the operator
+    /// would be tapping a control that does nothing.
+    #[tokio::test]
+    async fn polling_mode_posts_prompt_without_seeding_reactions() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "prompt_post"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/reactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let ch =
+            channel_at(&server.uri(), vec![ALLOWED_USER.to_string()]).with_approval_timeout_secs(0);
+        let _ = ch
+            .request_approval_attributed(ORIGIN_CHANNEL, &approval_request())
+            .await;
+
+        assert!(
+            ch.approval_posts.lock().await.is_empty(),
+            "polling mode must not register a reaction binding"
+        );
+        drop(server);
+    }
+
     /// Ordinary conversation must never be swallowed by the approval path.
     #[tokio::test]
     async fn ordinary_message_is_not_consumed() {
         let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
+        let _rx = pending_in_origin(&ch, "abc123").await;
 
         assert!(
             !ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "what is the weather"))
@@ -4204,11 +4492,7 @@ mod approval_tests {
             ("abc123 always", ChannelApprovalResponse::AlwaysApprove),
         ] {
             let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            ch.pending_approvals
-                .lock()
-                .await
-                .insert("abc123".to_string(), tx);
+            let rx = pending_in_origin(&ch, "abc123").await;
             assert!(
                 ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, reply))
                     .await
@@ -4230,10 +4514,15 @@ mod approval_tests {
         assert!(ch.approval_timeout_secs > 0);
     }
 
-    /// The runtime denies on its own authority when nobody answers, and must
-    /// attribute that to the timeout rather than to the operator.
+    /// A prompt that never reaches Mattermost is an error, not a decision.
+    ///
+    /// Renamed from `timeout_denies_attributed_to_runtime_not_operator`, which
+    /// this never tested: the unreachable test host makes `create_post` fail, so
+    /// it returns through the post-`Err` branch and never reaches the timeout
+    /// arms. `timeout_after_successful_post_is_attributed_to_the_runtime` below
+    /// is the actual timeout regression.
     #[tokio::test]
-    async fn timeout_denies_attributed_to_runtime_not_operator() {
+    async fn failed_prompt_post_is_an_error_not_an_operator_decision() {
         let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]).with_approval_timeout_secs(0);
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
             tool_name: "shell".into(),
