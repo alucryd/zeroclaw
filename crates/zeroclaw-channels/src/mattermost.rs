@@ -34,6 +34,114 @@ struct PendingApproval {
     sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
 }
 
+/// How many retired tokens to remember. A token only needs to outlive the
+/// in-flight events that were already in flight when it was retired, so this is
+/// deliberately small and bounded — it is a race window, not a history.
+const RETIRED_APPROVAL_TOKENS: usize = 64;
+
+/// All approval bookkeeping, behind one lock.
+///
+/// The two maps and the retired-token ring are a single unit of state because
+/// every operation on them has to be one indivisible transition. Splitting them
+/// across separate locks — or taking the same lock more than once per decision —
+/// lets the reaction path retire a token in between the text path's *recognize*
+/// and *remove* steps, at which point the text resolver can no longer tell "this
+/// was never mine" from "I just lost the race", and the losing `<token> yes` is
+/// forwarded to the model as ordinary conversation.
+#[derive(Default)]
+struct ApprovalState {
+    /// Live prompts, keyed by the token echoed back in a reply.
+    pending: HashMap<String, PendingApproval>,
+    /// Prompt post ID -> token, for resolving one-tap emoji reactions.
+    posts: HashMap<String, String>,
+    /// Tokens already answered, cancelled, or timed out. Retained briefly so a
+    /// reply that lost the race is still recognized as approval traffic and
+    /// suppressed rather than delivered to the model.
+    retired: std::collections::VecDeque<String>,
+}
+
+impl ApprovalState {
+    /// Retire `token` and any post bound to it, remembering the token so a
+    /// late-arriving decision for it is still recognized.
+    fn retire(&mut self, token: &str) -> Option<PendingApproval> {
+        let removed = self.pending.remove(token);
+        self.posts.retain(|_, bound| bound != token);
+        if !self.retired.iter().any(|seen| seen == token) {
+            if self.retired.len() == RETIRED_APPROVAL_TOKENS {
+                self.retired.pop_front();
+            }
+            self.retired.push_back(token.to_string());
+        }
+        removed
+    }
+
+    fn was_retired(&self, token: &str) -> bool {
+        self.retired.iter().any(|seen| seen == token)
+    }
+}
+
+/// What the text resolver did with a post.
+///
+/// The distinction that matters is `NotFound` versus everything else: only text
+/// this channel has no claim on may continue to the model. Every other outcome —
+/// resolved, rejected, or too late — is approval-protocol traffic and is
+/// swallowed, so a decision the operator typed can never surface as a chat
+/// message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalReplyOutcome {
+    /// Not an approval reply for any prompt this channel knows about.
+    NotFound,
+    /// Recognized as approval traffic and consumed.
+    Consumed,
+}
+
+/// Retires a prompt's state when the request future goes away.
+///
+/// Registration happens before the prompt is posted, but the explicit cleanup
+/// branches only run if `request_approval_attributed` reaches its own match arm.
+/// A future that is *dropped* never reaches them, and the routed approval caller
+/// wraps this one in an outer `tokio::time::timeout` whose default (120s) is
+/// shorter than this channel's own (300s) — so cancellation mid-prompt is a
+/// supported configuration, not a theoretical executor behaviour. Without this
+/// guard each routed timeout would strand a token and its post binding in a
+/// long-lived channel, and a later reply or tap would appear to answer a prompt
+/// whose tool call had already been abandoned.
+///
+/// `Drop` cannot await, which is why [`ApprovalState`] sits behind a synchronous
+/// mutex: cleanup runs inline and is therefore deterministic to assert in tests,
+/// rather than being deferred to a spawned task.
+struct ApprovalGuard {
+    approvals: Arc<Mutex<ApprovalState>>,
+    token: String,
+    /// Cleared once the request has retired the token itself, so the normal
+    /// completion path does not retire it twice.
+    armed: bool,
+}
+
+impl ApprovalGuard {
+    fn new(approvals: Arc<Mutex<ApprovalState>>, token: String) -> Self {
+        Self {
+            approvals,
+            token,
+            armed: true,
+        }
+    }
+
+    /// Retire the prompt now and stand the guard down.
+    fn retire(&mut self) {
+        if self.armed {
+            self.approvals.lock().retire(&self.token);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ApprovalGuard {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
 /// The channel ID half of a recipient.
 ///
 /// Recipients are `channel_id` or `channel_id:root_id` for a threaded reply.
@@ -164,24 +272,16 @@ pub struct MattermostChannel {
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     /// How this channel receives inbound messages. Defaults to `Polling`.
     listen_mode: MattermostListenMode,
-    /// In-flight approval prompts, keyed by the 6-character token echoed back
-    /// in the operator's reply. The receive path resolves the matching sender;
-    /// `request_approval_attributed` owns the receiver.
+    /// In-flight approval prompts, the post bindings that resolve one-tap
+    /// reactions, and the recently-retired tokens — see [`ApprovalState`].
     ///
-    /// A `tokio` mutex rather than the `parking_lot` one used elsewhere in this
-    /// file: the receive path holds it across an `.await`.
-    pending_approvals: Arc<tokio::sync::Mutex<HashMap<String, PendingApproval>>>,
-    /// Maps the prompt post's ID to the token in `pending_approvals`, so a
-    /// reaction on that post resolves the right request.
-    ///
-    /// A separate map rather than a second copy of the sender: a
-    /// `oneshot::Sender` cannot be cloned, and duplicating it would give the
-    /// reply path and the reaction path two independent chances to answer the
-    /// same prompt. `pending_approvals` stays the single owner of the decision;
-    /// this only translates a post ID into its token.
-    ///
-    /// Only populated in `Websocket` listen mode — see `request_approval_attributed`.
-    approval_posts: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// A `parking_lot` mutex, like the rest of this file. The guard is never
+    /// held across an `.await`: everything asynchronous a decision needs (the
+    /// bot identity, the peer list) is resolved before the lock is taken, so
+    /// each decision is one uninterruptible critical section. That is also what
+    /// lets [`ApprovalGuard`] clean up synchronously from `Drop`, where awaiting
+    /// is not possible.
+    approvals: Arc<Mutex<ApprovalState>>,
     /// Seconds to wait for an operator reply before the runtime denies on its
     /// own authority. Mirrors `[channels.mattermost.<alias>].approval_timeout_secs`.
     approval_timeout_secs: u64,
@@ -220,8 +320,7 @@ impl MattermostChannel {
             transcription: None,
             transcription_manager: None,
             listen_mode: MattermostListenMode::default(),
-            pending_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            approval_posts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            approvals: Arc::new(Mutex::new(ApprovalState::default())),
             // Sourced from the config type so the in-Rust default cannot drift
             // from the serde one. `0` here would be an already-elapsed
             // deadline that denies every approval.
@@ -993,21 +1092,18 @@ impl Channel for MattermostChannel {
         );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals.lock().await.insert(
+        self.approvals.lock().pending.insert(
             token.clone(),
             PendingApproval {
                 channel_id: recipient_channel_id(recipient).to_string(),
                 sender: tx,
             },
         );
+        // Armed from here on: every exit below — including a dropped future —
+        // retires the token and any post bound to it.
+        let mut guard = ApprovalGuard::new(Arc::clone(&self.approvals), token.clone());
 
-        let post_id = match self.create_post(&SendMessage::new(text, recipient)).await {
-            Ok(post_id) => post_id,
-            Err(err) => {
-                self.pending_approvals.lock().await.remove(&token);
-                return Err(err);
-            }
-        };
+        let post_id = self.create_post(&SendMessage::new(text, recipient)).await?;
 
         // Offer the one-tap path only when we would actually see the tap.
         // Reactions reach us as `reaction_added` WebSocket events; the polling
@@ -1016,9 +1112,9 @@ impl Channel for MattermostChannel {
         if self.listen_mode == zeroclaw_config::schema::MattermostListenMode::Websocket
             && !post_id.is_empty()
         {
-            self.approval_posts
+            self.approvals
                 .lock()
-                .await
+                .posts
                 .insert(post_id.clone(), token.clone());
             self.seed_approval_reactions(&post_id).await;
         }
@@ -1026,27 +1122,22 @@ impl Channel for MattermostChannel {
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(response)) => {
-                    // The resolving path already removed the token; drop the
-                    // post mapping so a later reaction on the same post cannot
-                    // find a stale entry.
-                    self.approval_posts.lock().await.remove(&post_id);
                     zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
                 }
-                Ok(Err(_)) => {
-                    self.retire_approval(&token, &post_id).await;
-                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                        ChannelApprovalResponse::Deny,
-                        zeroclaw_api::channel::ApprovalSource::Unreachable,
-                    )
-                }
-                Err(_) => {
-                    self.retire_approval(&token, &post_id).await;
-                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                        ChannelApprovalResponse::Deny,
-                        zeroclaw_api::channel::ApprovalSource::TimedOut,
-                    )
-                }
+                Ok(Err(_)) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::Unreachable,
+                ),
+                Err(_) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             };
+        // One retirement for every outcome. The resolving path already removed
+        // the pending entry, but the token still has to be remembered as retired
+        // and any post binding dropped, so a tap arriving after the decision
+        // cannot find stale state.
+        guard.retire();
         Ok(Some(attributed))
     }
 }
@@ -1407,7 +1498,13 @@ impl MattermostChannel {
         // The allowlist is re-checked explicitly rather than inherited, since
         // skipping the parse also skips its authorization gate — approving a
         // tool call is at least as privileged as sending a message.
-        if self.try_resolve_approval_reply(post).await {
+        // Only text with no claim on a prompt continues to the model. Every
+        // other outcome — resolved, rejected, or arriving after the prompt was
+        // already retired — is approval-protocol traffic, so a decision the
+        // operator typed can never surface as a chat message.
+        if self.try_resolve_approval_reply(post, bot_user_id).await
+            == ApprovalReplyOutcome::Consumed
+        {
             return false;
         }
 
@@ -1461,11 +1558,6 @@ impl MattermostChannel {
     ///
     /// Leaving either behind would let a late reply or a late tap resolve a
     /// prompt whose caller has already been told the answer.
-    async fn retire_approval(&self, token: &str, post_id: &str) {
-        self.pending_approvals.lock().await.remove(token);
-        self.approval_posts.lock().await.remove(post_id);
-    }
-
     /// Decode a `reaction_added` event's payload. Mattermost sends the reaction
     /// as a JSON *string* under `data.reaction`, the same shape as `data.post`.
     fn ws_reaction_from_event(event: &serde_json::Value) -> Option<serde_json::Value> {
@@ -1497,7 +1589,7 @@ impl MattermostChannel {
 
         // Cheap check first: a reaction on any other post is not ours, and
         // rejecting it here keeps unrelated chatter out of the auth logs.
-        let Some(token) = self.approval_posts.lock().await.get(post_id).cloned() else {
+        let Some(token) = self.approvals.lock().posts.get(post_id).cloned() else {
             return false;
         };
 
@@ -1506,11 +1598,16 @@ impl MattermostChannel {
             .and_then(|user| user.as_str())
             .unwrap_or("");
 
+        // Resolved before the lock so the decision below stays one
+        // uninterruptible critical section.
+        let (bot_user_id, _) = self.get_bot_identity().await;
+
         // The bot seeds both emoji itself, so its own reactions come straight
         // back as events. Answering them would auto-approve every prompt the
-        // instant it is posted.
-        let (bot_user_id, _) = self.get_bot_identity().await;
-        if !bot_user_id.is_empty() && user_id == bot_user_id {
+        // instant it is posted. An event with no author is rejected for the same
+        // reason it is on the text path: a wildcard peer group would otherwise
+        // match the empty string and treat "no identity" as authorized.
+        if user_id.is_empty() || (!bot_user_id.is_empty() && user_id == bot_user_id) {
             return false;
         }
 
@@ -1531,96 +1628,133 @@ impl MattermostChannel {
             return false;
         }
 
-        let Some(pending) = self.pending_approvals.lock().await.remove(&token) else {
+        // Retiring drops the post binding too, so a second tap on the same post
+        // finds nothing rather than a stale token.
+        let Some(pending) = self.approvals.lock().retire(&token) else {
             return false;
         };
-        let sender = pending.sender;
-        self.approval_posts.lock().await.remove(post_id);
         // A closed receiver means the waiter already timed out; the decision is
         // simply dropped.
-        let _ = sender.send(response);
+        let _ = pending.sender.send(response);
         true
     }
 
     /// Consume `post` if it is an authorized reply to a pending approval
     /// prompt. Returns `true` when the post was consumed, so the caller skips
     /// the normal message path and the reply never reaches the model.
-    async fn try_resolve_approval_reply(&self, post: &serde_json::Value) -> bool {
+    /// `bot_user_id` is the authenticated identity from `get_bot_identity`.
+    /// It is passed in rather than read here because this runs *before*
+    /// `parse_mattermost_post`, and so inherits none of that parser's
+    /// protections — including its self-loop guard.
+    async fn try_resolve_approval_reply(
+        &self,
+        post: &serde_json::Value,
+        bot_user_id: &str,
+    ) -> ApprovalReplyOutcome {
         let text = post
             .get("message")
             .and_then(|message| message.as_str())
             .unwrap_or("");
         let Some((token, response)) = crate::util::parse_approval_reply(text) else {
-            return false;
+            return ApprovalReplyOutcome::NotFound;
         };
 
-        // Cheap check first: an unrecognized token is not ours, and rejecting
-        // it here avoids logging an authorization failure for text that merely
-        // resembles an approval reply.
-        if !self.pending_approvals.lock().await.contains_key(&token) {
-            return false;
-        }
-
-        // The reply has to come from the channel the prompt went to. The token
-        // is readable by everyone who can see the prompt, and this one channel
-        // instance serves many Mattermost channels, so without this an
-        // authorized user could carry a token into a different room and answer
-        // there. Peer-group membership below is a separate, necessary condition:
-        // it says *who* may decide, not *where* the decision is valid.
+        let user_id = post
+            .get("user_id")
+            .and_then(|user| user.as_str())
+            .unwrap_or("");
         let reply_channel = post
             .get("channel_id")
             .and_then(|channel| channel.as_str())
             .unwrap_or("");
-        let origin_channel = self
-            .pending_approvals
-            .lock()
-            .await
-            .get(&token)
-            .map(|pending| pending.channel_id.clone());
-        if origin_channel.as_deref() != Some(reply_channel) {
+
+        // Identity is checked before the allowlist, not through it. A wildcard
+        // peer group matches any string, including the empty one this yields for
+        // a malformed event and including the bot's own ID — so consulting the
+        // allowlist first would let the bot's own approval-shaped post answer a
+        // live prompt, and would treat "no identity" as "some authorized user".
+        if user_id.is_empty() || (!bot_user_id.is_empty() && user_id == bot_user_id) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "token": token,
-                        "reply_channel": reply_channel,
-                        "origin_channel": origin_channel,
+                        "reason": if user_id.is_empty() { "missing_identity" } else { "self_authored" },
                     })),
-                "ignoring approval reply from a channel the prompt was not posted to"
+                "ignoring approval reply with no usable author identity"
             );
-            // Consumed, not resolved: this is approval-reply text rather than a
-            // message for the model, and the prompt stays answerable in the
-            // channel it actually belongs to.
-            return true;
+            // Consumed: approval-shaped text must never reach the model, and a
+            // prompt the bot itself echoed is not an operator decision.
+            return ApprovalReplyOutcome::Consumed;
         }
 
-        let user_id = post
-            .get("user_id")
-            .and_then(|user| user.as_str())
-            .unwrap_or("");
-        if !self.is_user_allowed(user_id) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"user_id": user_id, "token": token})),
-                "ignoring approval reply from unauthorized user"
-            );
-            // Consume it regardless: the text is an approval reply, not a
-            // message for the model, and leaving the prompt pending lets an
-            // authorized operator still answer it.
-            return true;
-        }
+        // One critical section for the whole decision. Recognition, destination,
+        // and removal cannot be split: the reaction path shares this state, and
+        // a token retired between two of those steps would otherwise look like
+        // text that was never ours and be forwarded to the model.
+        let (outcome, resolved) = {
+            let mut state = self.approvals.lock();
 
-        let Some(pending) = self.pending_approvals.lock().await.remove(&token) else {
-            return false;
+            let Some(pending) = state.pending.get(&token) else {
+                // Already answered, cancelled, or timed out: still ours, so the
+                // losing reply is swallowed rather than delivered as chat.
+                return if state.was_retired(&token) {
+                    ApprovalReplyOutcome::Consumed
+                } else {
+                    ApprovalReplyOutcome::NotFound
+                };
+            };
+
+            // The reply has to come from the channel the prompt went to. The
+            // token is readable by everyone who can see the prompt, and this one
+            // channel instance serves many Mattermost channels, so without this
+            // an authorized user could carry a token into a different room and
+            // answer there. Peer-group membership is a separate, necessary
+            // condition: it says *who* may decide, not *where*.
+            if pending.channel_id != reply_channel {
+                let origin_channel = pending.channel_id.clone();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "token": token,
+                            "reply_channel": reply_channel,
+                            "origin_channel": origin_channel,
+                        })),
+                    "ignoring approval reply from a channel the prompt was not posted to"
+                );
+                // Consumed, not resolved: the prompt stays answerable in the
+                // channel it actually belongs to.
+                return ApprovalReplyOutcome::Consumed;
+            }
+
+            if !self.is_user_allowed(user_id) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"user_id": user_id, "token": token})),
+                    "ignoring approval reply from unauthorized user"
+                );
+                // Leaves the prompt pending so an authorized operator can still
+                // answer, but never forwards the attempt to the model.
+                return ApprovalReplyOutcome::Consumed;
+            }
+
+            (
+                ApprovalReplyOutcome::Consumed,
+                state.retire(&token).map(|pending| pending.sender),
+            )
         };
-        let sender = pending.sender;
-        // A closed receiver means the waiter already gave up (timed out); the
-        // decision is simply dropped, and the reply is still consumed.
-        let _ = sender.send(response);
-        true
+
+        if let Some(sender) = resolved {
+            // A closed receiver means the waiter already gave up; the decision
+            // is dropped and the reply is still consumed.
+            let _ = sender.send(response);
+        }
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3951,6 +4085,7 @@ mod approval_tests {
     use serde_json::json;
 
     const ALLOWED_USER: &str = "operator_user_id";
+    const BOT_USER: &str = "bot_user_id";
 
     fn channel_with_peers(peers: Vec<String>) -> MattermostChannel {
         MattermostChannel::new(
@@ -3992,7 +4127,7 @@ mod approval_tests {
         token: &str,
     ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals.lock().await.insert(
+        ch.approvals.lock().pending.insert(
             token.to_string(),
             PendingApproval {
                 channel_id: ORIGIN_CHANNEL.to_string(),
@@ -4029,9 +4164,9 @@ mod approval_tests {
         post_id: &str,
     ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
         let rx = pending_in_origin(ch, token).await;
-        ch.approval_posts
+        ch.approvals
             .lock()
-            .await
+            .posts
             .insert(post_id.to_string(), token.to_string());
         rx
     }
@@ -4054,11 +4189,11 @@ mod approval_tests {
         assert!(consumed, "a decision reaction must resolve the prompt");
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
         assert!(
-            ch.pending_approvals.lock().await.is_empty(),
+            ch.approvals.lock().pending.is_empty(),
             "resolving must retire the pending token"
         );
         assert!(
-            ch.approval_posts.lock().await.is_empty(),
+            ch.approvals.lock().posts.is_empty(),
             "resolving must retire the post mapping so a later tap finds nothing"
         );
     }
@@ -4105,7 +4240,7 @@ mod approval_tests {
             "an unauthorized tap must not deliver a response"
         );
         assert!(
-            !ch.pending_approvals.lock().await.is_empty(),
+            !ch.approvals.lock().pending.is_empty(),
             "the prompt must stay answerable by an authorized operator"
         );
     }
@@ -4136,7 +4271,7 @@ mod approval_tests {
         );
         assert!(rx.try_recv().is_err(), "no response must be delivered");
         assert!(
-            !ch.pending_approvals.lock().await.is_empty(),
+            !ch.approvals.lock().pending.is_empty(),
             "the prompt must stay pending"
         );
     }
@@ -4157,7 +4292,7 @@ mod approval_tests {
             .await
         );
         assert!(rx.try_recv().is_err());
-        assert!(!ch.pending_approvals.lock().await.is_empty());
+        assert!(!ch.approvals.lock().pending.is_empty());
     }
 
     /// A decision emoji on some other post must not resolve a live prompt.
@@ -4175,7 +4310,7 @@ mod approval_tests {
             .await
         );
         assert!(rx.try_recv().is_err());
-        assert!(!ch.pending_approvals.lock().await.is_empty());
+        assert!(!ch.approvals.lock().pending.is_empty());
     }
 
     /// The two paths share one decision. Whichever answers first retires the
@@ -4186,8 +4321,9 @@ mod approval_tests {
         let rx = pending_with_post(&ch, "abc123", "prompt_post").await;
 
         assert!(
-            ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"))
+            ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"), BOT_USER)
                 .await
+                == ApprovalReplyOutcome::Consumed
         );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
 
@@ -4211,16 +4347,17 @@ mod approval_tests {
         let rx = pending_in_origin(&ch, "abc123").await;
 
         let consumed = ch
-            .try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"))
+            .try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"), BOT_USER)
             .await;
 
-        assert!(
+        assert_eq!(
             consumed,
+            ApprovalReplyOutcome::Consumed,
             "an approval reply must not fall through to the model"
         );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
         assert!(
-            ch.pending_approvals.lock().await.is_empty(),
+            ch.approvals.lock().pending.is_empty(),
             "resolving must retire the pending token"
         );
     }
@@ -4233,11 +4370,12 @@ mod approval_tests {
         let mut rx = pending_in_origin(&ch, "abc123").await;
 
         let consumed = ch
-            .try_resolve_approval_reply(&post_from("intruder_user_id", "abc123 yes"))
+            .try_resolve_approval_reply(&post_from("intruder_user_id", "abc123 yes"), BOT_USER)
             .await;
 
-        assert!(
+        assert_eq!(
             consumed,
+            ApprovalReplyOutcome::Consumed,
             "the reply is protocol text, not a message for the model"
         );
         assert!(
@@ -4245,7 +4383,7 @@ mod approval_tests {
             "an unauthorized reply must not decide the approval"
         );
         assert!(
-            ch.pending_approvals.lock().await.contains_key("abc123"),
+            ch.approvals.lock().pending.contains_key("abc123"),
             "the prompt must stay pending so an authorized operator can still answer"
         );
     }
@@ -4256,8 +4394,9 @@ mod approval_tests {
     async fn unknown_token_is_not_consumed() {
         let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
         assert!(
-            !ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "zzz999 yes"))
+            ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "zzz999 yes"), BOT_USER)
                 .await
+                == ApprovalReplyOutcome::NotFound
         );
     }
 
@@ -4292,7 +4431,7 @@ mod approval_tests {
             "a reply from another channel must not deliver a decision"
         );
         assert!(
-            ch.pending_approvals.lock().await.contains_key("abc123"),
+            ch.approvals.lock().pending.contains_key("abc123"),
             "the prompt must stay answerable in the channel it belongs to"
         );
         assert!(
@@ -4313,7 +4452,7 @@ mod approval_tests {
         .await;
 
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
-        assert!(ch.pending_approvals.lock().await.is_empty());
+        assert!(ch.approvals.lock().pending.is_empty());
     }
 
     /// Build a channel pointed at a mock Mattermost server.
@@ -4372,11 +4511,11 @@ mod approval_tests {
             "an unanswered prompt is the runtime denying, not an operator refusing"
         );
         assert!(
-            ch.pending_approvals.lock().await.is_empty(),
+            ch.approvals.lock().pending.is_empty(),
             "a timed-out prompt must not leak its token"
         );
         assert!(
-            ch.approval_posts.lock().await.is_empty(),
+            ch.approvals.lock().posts.is_empty(),
             "a timed-out prompt must not leak its post binding"
         );
     }
@@ -4399,11 +4538,17 @@ mod approval_tests {
             )
             .mount(&server)
             .await;
-        // The prompt carries the token and the tool, or the operator cannot answer.
+        // The prompt carries the token and the tool, or the operator cannot
+        // answer. Matched on those protocol-exact fields rather than on the
+        // heading: the heading comes from the Fluent catalogue and is localized,
+        // so asserting its English spelling would fail this test under a
+        // supported non-English locale even though the prompt is correct. The
+        // token and tool name are echoed verbatim in every locale — that is
+        // precisely what `parse_approval_reply` matches on.
         Mock::given(method("POST"))
             .and(path("/api/v4/posts"))
-            .and(body_string_contains("APPROVAL REQUIRED"))
             .and(body_string_contains("shell"))
+            .and(body_string_contains("rm -rf /"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "prompt_post"})))
             .expect(1)
             .mount(&server)
@@ -4464,7 +4609,7 @@ mod approval_tests {
             .await;
 
         assert!(
-            ch.approval_posts.lock().await.is_empty(),
+            ch.approvals.lock().posts.is_empty(),
             "polling mode must not register a reaction binding"
         );
         drop(server);
@@ -4477,10 +4622,14 @@ mod approval_tests {
         let _rx = pending_in_origin(&ch, "abc123").await;
 
         assert!(
-            !ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "what is the weather"))
-                .await
+            ch.try_resolve_approval_reply(
+                &post_from(ALLOWED_USER, "what is the weather"),
+                BOT_USER
+            )
+            .await
+                == ApprovalReplyOutcome::NotFound
         );
-        assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+        assert!(ch.approvals.lock().pending.contains_key("abc123"));
     }
 
     /// `deny` and `always` must map to their own outcomes rather than
@@ -4494,8 +4643,9 @@ mod approval_tests {
             let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
             let rx = pending_in_origin(&ch, "abc123").await;
             assert!(
-                ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, reply))
+                ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, reply), BOT_USER)
                     .await
+                    == ApprovalReplyOutcome::Consumed
             );
             assert_eq!(rx.await.unwrap(), expected);
         }
@@ -4538,8 +4688,265 @@ mod approval_tests {
             "a failed prompt post must not be reported as an operator decision"
         );
         assert!(
-            ch.pending_approvals.lock().await.is_empty(),
+            ch.approvals.lock().pending.is_empty(),
             "a failed prompt must not leak its pending token"
         );
+    }
+}
+
+/// Regressions for the three approval lifecycle/authorization defects raised in
+/// review: a losing text reply reaching the model, cancelled futures stranding
+/// state, and approval decisions bypassing the identity checks that
+/// `parse_mattermost_post` applies to ordinary messages.
+#[cfg(test)]
+mod approval_lifecycle_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ALLOWED_USER: &str = "operator_user_id";
+    const BOT_USER: &str = "bot_user_id";
+    const ORIGIN_CHANNEL: &str = "chan1";
+
+    fn channel_with_peers(peers: Vec<String>) -> MattermostChannel {
+        MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_lifecycle_alias",
+            Arc::new(move || peers.clone()),
+            false,
+            false,
+        )
+    }
+
+    fn post_from(user_id: &str, message: &str) -> serde_json::Value {
+        json!({
+            "id": "post1",
+            "user_id": user_id,
+            "message": message,
+            "create_at": 1,
+            "channel_id": ORIGIN_CHANNEL,
+        })
+    }
+
+    fn pending(
+        ch: &MattermostChannel,
+        token: &str,
+    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.approvals.lock().pending.insert(
+            token.to_string(),
+            PendingApproval {
+                channel_id: ORIGIN_CHANNEL.to_string(),
+                sender: tx,
+            },
+        );
+        rx
+    }
+
+    /// The losing half of a reply/reaction race must not become chat.
+    ///
+    /// Recognition and removal are one transition now, so a reply arriving after
+    /// the reaction already answered cannot be mistaken for text that was never
+    /// ours. Previously the final `remove` returned `None`, the resolver
+    /// reported "not mine", and `process_inbound_post` forwarded the operator's
+    /// `<token> yes` to the model as ordinary conversation.
+    #[tokio::test]
+    async fn losing_reply_after_reaction_wins_is_not_forwarded_to_the_model() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let rx = pending(&ch, "abc123");
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        // The reaction path answers first and retires the token.
+        let resolved = ch
+            .approvals
+            .lock()
+            .retire("abc123")
+            .expect("token was live");
+        let _ = resolved.sender.send(ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+
+        // The operator's typed reply is already in flight and lands afterwards.
+        ch.process_inbound_post(
+            &post_from(ALLOWED_USER, "abc123 yes"),
+            BOT_USER,
+            "glados",
+            0,
+            ORIGIN_CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        assert!(
+            inbound.try_recv().is_err(),
+            "a reply that lost the race must be suppressed, not delivered to the model"
+        );
+    }
+
+    /// Text that merely looks like an approval reply, for a token this channel
+    /// never issued, is ordinary conversation and must still reach the model.
+    #[tokio::test]
+    async fn unrelated_token_shaped_text_still_reaches_the_model() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        assert_eq!(
+            ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "zzz999 yes"), BOT_USER)
+                .await,
+            ApprovalReplyOutcome::NotFound,
+            "only tokens this channel knows about may be swallowed"
+        );
+    }
+
+    /// Retired-token memory is bounded, so a long-lived channel cannot grow it
+    /// without limit.
+    #[test]
+    fn retired_token_memory_is_bounded() {
+        let ch = channel_with_peers(Vec::new());
+        for index in 0..(RETIRED_APPROVAL_TOKENS * 3) {
+            ch.approvals.lock().retire(&format!("tok{index:04}"));
+        }
+        assert_eq!(
+            ch.approvals.lock().retired.len(),
+            RETIRED_APPROVAL_TOKENS,
+            "the retired ring must stay capped"
+        );
+    }
+
+    /// Dropping the request future must retire everything it registered.
+    ///
+    /// The routed approval caller wraps this future in an outer timeout whose
+    /// default is shorter than this channel's own, so cancellation mid-prompt is
+    /// a supported configuration. Cleanup used to live only in the explicit
+    /// match arms, which a dropped future never reaches.
+    #[test]
+    fn dropping_the_guard_retires_pending_and_post_state() {
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let _rx = pending(&ch, "abc123");
+        ch.approvals
+            .lock()
+            .posts
+            .insert("post1".to_string(), "abc123".to_string());
+
+        {
+            let _guard = ApprovalGuard::new(Arc::clone(&ch.approvals), "abc123".to_string());
+            assert!(!ch.approvals.lock().pending.is_empty());
+        } // dropped here, as an outer timeout would
+
+        let state = ch.approvals.lock();
+        assert!(
+            state.pending.is_empty(),
+            "a cancelled request must not strand its pending token"
+        );
+        assert!(
+            state.posts.is_empty(),
+            "a cancelled request must not strand its post binding"
+        );
+        assert!(
+            state.was_retired("abc123"),
+            "the token must be remembered so a late tap is still recognized"
+        );
+    }
+
+    /// A guard that already retired its token must not retire it a second time
+    /// when dropped — otherwise the normal completion path would evict a token
+    /// a *later* request had legitimately reused.
+    #[test]
+    fn explicit_retire_disarms_the_guard() {
+        let ch = channel_with_peers(Vec::new());
+        let _rx = pending(&ch, "abc123");
+        {
+            let mut guard = ApprovalGuard::new(Arc::clone(&ch.approvals), "abc123".to_string());
+            guard.retire();
+            // A new request reuses the same token before the guard drops.
+            let _reused = pending(&ch, "abc123");
+        }
+        assert!(
+            ch.approvals.lock().pending.contains_key("abc123"),
+            "a disarmed guard must not evict a later request's token"
+        );
+    }
+
+    /// The bot's own approval-shaped post must never answer a prompt, even when
+    /// the peer group is a wildcard that matches every identity.
+    #[tokio::test]
+    async fn bot_authored_reply_cannot_self_approve_under_wildcard() {
+        let ch = channel_with_peers(vec!["*".to_string()]);
+        let mut rx = pending(&ch, "abc123");
+
+        let outcome = ch
+            .try_resolve_approval_reply(&post_from(BOT_USER, "abc123 yes"), BOT_USER)
+            .await;
+
+        assert_eq!(
+            outcome,
+            ApprovalReplyOutcome::Consumed,
+            "the bot's own echo is protocol traffic, not a message for the model"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the bot must not be able to approve its own prompt"
+        );
+        assert!(
+            ch.approvals.lock().pending.contains_key("abc123"),
+            "the prompt must stay answerable by a real operator"
+        );
+    }
+
+    /// A malformed event with no author must not be treated as an authorized
+    /// operator by a wildcard allowlist.
+    #[tokio::test]
+    async fn missing_identity_reply_cannot_approve_under_wildcard() {
+        let ch = channel_with_peers(vec!["*".to_string()]);
+        let mut rx = pending(&ch, "abc123");
+
+        let outcome = ch
+            .try_resolve_approval_reply(
+                &json!({
+                    "id": "post1",
+                    "message": "abc123 yes",
+                    "create_at": 1,
+                    "channel_id": ORIGIN_CHANNEL,
+                }),
+                BOT_USER,
+            )
+            .await;
+
+        assert_eq!(outcome, ApprovalReplyOutcome::Consumed);
+        assert!(
+            rx.try_recv().is_err(),
+            "an event with no identity must not decide an approval"
+        );
+    }
+
+    /// The reaction path has the same missing-identity exposure and the same
+    /// rule: a wildcard peer group must not turn an absent author into an
+    /// authorized one.
+    #[tokio::test]
+    async fn missing_identity_reaction_cannot_approve_under_wildcard() {
+        let ch = channel_with_peers(vec!["*".to_string()]);
+        let mut rx = pending(&ch, "abc123");
+        ch.approvals
+            .lock()
+            .posts
+            .insert("post1".to_string(), "abc123".to_string());
+
+        let event = json!({
+            "data": {
+                "reaction": json!({
+                    "post_id": "post1",
+                    "emoji_name": APPROVAL_EMOJI_APPROVE,
+                })
+                .to_string(),
+            }
+        });
+
+        assert!(
+            !ch.try_resolve_approval_reaction(&event).await,
+            "a reaction with no author must not resolve an approval"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(ch.approvals.lock().pending.contains_key("abc123"));
     }
 }
