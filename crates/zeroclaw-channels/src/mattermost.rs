@@ -722,7 +722,13 @@ impl MattermostChannel {
             .and_then(|u| u.as_str())
             .unwrap_or("")
             .to_string();
-        if !id.is_empty() || !username.is_empty() {
+        // Cache only a *complete* identity. The ID is the half the approval path
+        // depends on — it is what distinguishes the bot's own post or seeded
+        // reaction from an operator's decision — so caching a username-only
+        // response would pin an empty ID for the lifetime of the channel and
+        // permanently disable the self-approval guard. Leaving it uncached costs
+        // one extra request and lets the next call recover.
+        if !id.is_empty() {
             let _ = self.bot_identity.set((id.clone(), username.clone()));
         }
         (id, username)
@@ -1607,7 +1613,30 @@ impl MattermostChannel {
         // instant it is posted. An event with no author is rejected for the same
         // reason it is on the text path: a wildcard peer group would otherwise
         // match the empty string and treat "no identity" as authorized.
-        if user_id.is_empty() || (!bot_user_id.is_empty() && user_id == bot_user_id) {
+        //
+        // An unknown bot ID fails closed here too, and this path is the sharper
+        // case: the bot's own seeded ✅ arrives within milliseconds of the
+        // prompt, so skipping the self-check while identity is unresolved would
+        // approve the tool call almost immediately and without any human input.
+        let reason = if user_id.is_empty() {
+            Some("missing_author_identity")
+        } else if bot_user_id.is_empty() {
+            Some("unknown_bot_identity")
+        } else if user_id == bot_user_id {
+            // The bot's own seeded reaction: expected on every prompt, so this
+            // is routine rather than a rejection worth logging.
+            return false;
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"token": token, "reason": reason})),
+                "refusing to decide an approval without a trustworthy bot identity"
+            );
             return false;
         }
 
@@ -1673,19 +1702,33 @@ impl MattermostChannel {
         // a malformed event and including the bot's own ID — so consulting the
         // allowlist first would let the bot's own approval-shaped post answer a
         // live prompt, and would treat "no identity" as "some authorized user".
-        if user_id.is_empty() || (!bot_user_id.is_empty() && user_id == bot_user_id) {
+        //
+        // An *unknown* bot ID fails closed rather than skipping the comparison.
+        // `get_bot_identity` yields an empty ID whenever `/users/me` is
+        // unreachable or answers without one, and treating that as "no self-check
+        // needed" would invert the guard exactly when identity is least certain:
+        // under a wildcard peer group the bot's own post would then pass
+        // authorization and approve the tool it had just prompted for.
+        let reason = if user_id.is_empty() {
+            Some("missing_author_identity")
+        } else if bot_user_id.is_empty() {
+            Some("unknown_bot_identity")
+        } else if user_id == bot_user_id {
+            Some("self_authored")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "token": token,
-                        "reason": if user_id.is_empty() { "missing_identity" } else { "self_authored" },
-                    })),
-                "ignoring approval reply with no usable author identity"
+                    .with_attrs(::serde_json::json!({"token": token, "reason": reason})),
+                "refusing to decide an approval without a trustworthy author identity"
             );
-            // Consumed: approval-shaped text must never reach the model, and a
-            // prompt the bot itself echoed is not an operator decision.
+            // Consumed, and the prompt stays pending: approval-shaped text must
+            // never reach the model, and refusing here only defers the decision
+            // to a reply made once identity can be established.
             return ApprovalReplyOutcome::Consumed;
         }
 
@@ -4088,7 +4131,7 @@ mod approval_tests {
     const BOT_USER: &str = "bot_user_id";
 
     fn channel_with_peers(peers: Vec<String>) -> MattermostChannel {
-        MattermostChannel::new(
+        let ch = MattermostChannel::new(
             "https://mm.example.com".into(),
             Some("token".into()),
             None,
@@ -4098,7 +4141,17 @@ mod approval_tests {
             Arc::new(move || peers.clone()),
             false,
             false,
-        )
+        );
+        // Seed the identity these fixtures would otherwise have to fetch. The
+        // host is unreachable, so `get_bot_identity` would yield an empty ID and
+        // the reaction path — which now fails closed on an unknown bot identity —
+        // would refuse to decide. Before that guard existed these fixtures passed
+        // only because the check was skipped when the ID was empty, so seeding it
+        // is what makes them exercise a real, known identity.
+        let _ = ch
+            .bot_identity
+            .set((BOT_USER.to_string(), "glados".to_string()));
+        ch
     }
 
     /// The channel every fixture prompt is posted into unless stated otherwise.
@@ -4948,5 +5001,202 @@ mod approval_lifecycle_tests {
         );
         assert!(rx.try_recv().is_err());
         assert!(ch.approvals.lock().pending.contains_key("abc123"));
+    }
+}
+
+/// The approval path must fail closed when the authenticated bot identity is
+/// unavailable.
+///
+/// `get_bot_identity` yields an empty ID whenever `/users/me` is unreachable,
+/// unauthorized, or answers without one. The self-approval guard used to skip
+/// the comparison in that case, which inverted it exactly when identity was
+/// least certain: with the documented wildcard peer group the bot's own user ID
+/// passes authorization, so the bot could answer the prompt it had just posted —
+/// and in WebSocket mode its own seeded ✅ arrives within milliseconds.
+#[cfg(test)]
+mod approval_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    const BOT_USER: &str = "bot_user_id";
+    const ORIGIN_CHANNEL: &str = "chan1";
+    /// The identity lookup failed, so the resolver has no ID to compare against.
+    const UNKNOWN_BOT: &str = "";
+
+    /// The documented wildcard peer group, which accepts every non-empty ID and
+    /// is therefore the configuration in which this guard is load-bearing.
+    fn wildcard_channel() -> MattermostChannel {
+        MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_identity_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+    }
+
+    fn pending(
+        ch: &MattermostChannel,
+        token: &str,
+    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.approvals.lock().pending.insert(
+            token.to_string(),
+            PendingApproval {
+                channel_id: ORIGIN_CHANNEL.to_string(),
+                sender: tx,
+            },
+        );
+        rx
+    }
+
+    /// Production boundary: a bot-authored reply, an unknown bot ID, and a
+    /// wildcard allowlist must not resolve the prompt or reach the model.
+    #[tokio::test]
+    async fn bot_reply_cannot_approve_when_bot_identity_is_unknown() {
+        let ch = wildcard_channel();
+        let mut rx = pending(&ch, "abc123");
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        ch.process_inbound_post(
+            &json!({
+                "id": "post1",
+                "user_id": BOT_USER,
+                "message": "abc123 yes",
+                "create_at": 1,
+                "channel_id": ORIGIN_CHANNEL,
+            }),
+            UNKNOWN_BOT,
+            "glados",
+            0,
+            ORIGIN_CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an unresolved bot identity must not let the bot approve its own prompt"
+        );
+        assert!(
+            ch.approvals.lock().pending.contains_key("abc123"),
+            "the prompt must stay answerable once identity can be established"
+        );
+        assert!(
+            inbound.try_recv().is_err(),
+            "approval-shaped text must not fall through to the model"
+        );
+    }
+
+    /// The reaction path is the sharper case: the bot seeds ✅ itself, so an
+    /// unknown identity here would approve within milliseconds of prompting.
+    #[tokio::test]
+    async fn bot_reaction_cannot_approve_when_bot_identity_is_unknown() {
+        let ch = wildcard_channel();
+        let mut rx = pending(&ch, "abc123");
+        ch.approvals
+            .lock()
+            .posts
+            .insert("post1".to_string(), "abc123".to_string());
+
+        // `get_bot_identity` will fail against this unreachable host, yielding
+        // the empty ID this test is about — the same value the listener passes
+        // on when `/users/me` is unavailable.
+        let event = json!({
+            "data": {
+                "reaction": json!({
+                    "post_id": "post1",
+                    "user_id": BOT_USER,
+                    "emoji_name": APPROVAL_EMOJI_APPROVE,
+                })
+                .to_string(),
+            }
+        });
+
+        assert!(
+            !ch.try_resolve_approval_reaction(&event).await,
+            "the bot's own seeded reaction must not approve while identity is unknown"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(
+            ch.approvals.lock().pending.contains_key("abc123"),
+            "the prompt must stay pending"
+        );
+    }
+
+    /// Even a genuine third-party operator is refused while identity is unknown:
+    /// without a bot ID the resolver cannot tell them apart from the bot, so it
+    /// declines rather than guessing.
+    #[tokio::test]
+    async fn third_party_reply_is_refused_while_bot_identity_is_unknown() {
+        let ch = wildcard_channel();
+        let mut rx = pending(&ch, "abc123");
+
+        let outcome = ch
+            .try_resolve_approval_reply(
+                &json!({
+                    "id": "post1",
+                    "user_id": "operator_user_id",
+                    "message": "abc123 yes",
+                    "create_at": 1,
+                    "channel_id": ORIGIN_CHANNEL,
+                }),
+                UNKNOWN_BOT,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            ApprovalReplyOutcome::Consumed,
+            "the reply is still approval traffic and must not reach the model"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(ch.approvals.lock().pending.contains_key("abc123"));
+    }
+
+    /// A username-only `/users/me` response must not be cached: pinning an empty
+    /// ID would disable the self-approval guard for the channel's whole life.
+    ///
+    /// Driven through the real `get_bot_identity` against a mock server, so it
+    /// tests the production caching rule rather than restating it.
+    #[tokio::test]
+    async fn partial_identity_response_is_not_cached() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A response carrying a username but no `id` — the shape the review
+        // identified as permanently poisoning the cache.
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"username": "glados"})))
+            .mount(&server)
+            .await;
+
+        let ch = MattermostChannel::new(
+            server.uri(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_identity_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        );
+
+        let (id, username) = ch.get_bot_identity().await;
+        assert!(id.is_empty(), "the response carried no id");
+        assert_eq!(username, "glados");
+        assert!(
+            ch.bot_identity.get().is_none(),
+            "a response with no ID must not populate the identity cache, or the \
+             self-approval guard stays disabled for the channel's whole life"
+        );
     }
 }
