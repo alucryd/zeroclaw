@@ -29,6 +29,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// room. Without the destination an authorized user could answer a prompt from a
 /// channel it was never posted to.
 struct PendingApproval {
+    /// Distinguishes this registration from any later one that happens to draw
+    /// the same token. `new_approval_token` is random but only six characters,
+    /// so token equality alone is not registration identity — without this, an
+    /// older still-armed guard could retire a newer request's prompt.
+    generation: u64,
     /// Mattermost channel ID the prompt was posted into.
     channel_id: String,
     sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
@@ -52,27 +57,68 @@ const RETIRED_APPROVAL_TOKENS: usize = 64;
 struct ApprovalState {
     /// Live prompts, keyed by the token echoed back in a reply.
     pending: HashMap<String, PendingApproval>,
-    /// Prompt post ID -> token, for resolving one-tap emoji reactions.
-    posts: HashMap<String, String>,
+    /// Prompt post ID -> (token, generation), for resolving one-tap emoji
+    /// reactions. The generation is carried so cleanup can drop only the
+    /// binding belonging to the registration being retired.
+    posts: HashMap<String, (String, u64)>,
     /// Tokens already answered, cancelled, or timed out. Retained briefly so a
     /// reply that lost the race is still recognized as approval traffic and
     /// suppressed rather than delivered to the model.
     retired: std::collections::VecDeque<String>,
+    /// Monotonic registration counter. Never reused within a channel's life.
+    next_generation: u64,
 }
 
 impl ApprovalState {
-    /// Retire `token` and any post bound to it, remembering the token so a
-    /// late-arriving decision for it is still recognized.
+    /// Retire whichever registration currently holds `token`, remembering the
+    /// token so a late-arriving decision for it is still recognized.
+    ///
+    /// Used by the resolving paths, which act on the registration that is live
+    /// *now*. Cancellation cleanup must use [`ApprovalState::retire_generation`]
+    /// instead, so a stale guard cannot evict a newer request.
     fn retire(&mut self, token: &str) -> Option<PendingApproval> {
+        let generation = self.pending.get(token).map(|pending| pending.generation);
+        match generation {
+            Some(generation) => self.retire_generation(token, generation),
+            None => {
+                // Nothing pending, but the token still has to be remembered:
+                // a decision that arrives after this point is late, not foreign.
+                self.remember_retired(token);
+                None
+            }
+        }
+    }
+
+    /// Retire `token` only if the live registration is the one identified by
+    /// `generation`.
+    ///
+    /// A guard armed for an earlier request may still be alive when a later
+    /// request draws the same six-character token. Retiring by token alone would
+    /// then delete the newer request's sender and post binding, silently
+    /// stranding an approval the operator can still see.
+    fn retire_generation(&mut self, token: &str, generation: u64) -> Option<PendingApproval> {
+        let matches = self
+            .pending
+            .get(token)
+            .is_some_and(|pending| pending.generation == generation);
+        if !matches {
+            return None;
+        }
         let removed = self.pending.remove(token);
-        self.posts.retain(|_, bound| bound != token);
+        self.posts.retain(|_, (bound, bound_generation)| {
+            bound != token || *bound_generation != generation
+        });
+        self.remember_retired(token);
+        removed
+    }
+
+    fn remember_retired(&mut self, token: &str) {
         if !self.retired.iter().any(|seen| seen == token) {
             if self.retired.len() == RETIRED_APPROVAL_TOKENS {
                 self.retired.pop_front();
             }
             self.retired.push_back(token.to_string());
         }
-        removed
     }
 
     fn was_retired(&self, token: &str) -> bool {
@@ -113,16 +159,20 @@ enum ApprovalReplyOutcome {
 struct ApprovalGuard {
     approvals: Arc<Mutex<ApprovalState>>,
     token: String,
+    /// The registration this guard owns. Cleanup is conditional on it, so a
+    /// stale guard cannot retire a later request that reused the token.
+    generation: u64,
     /// Cleared once the request has retired the token itself, so the normal
     /// completion path does not retire it twice.
     armed: bool,
 }
 
 impl ApprovalGuard {
-    fn new(approvals: Arc<Mutex<ApprovalState>>, token: String) -> Self {
+    fn new(approvals: Arc<Mutex<ApprovalState>>, token: String, generation: u64) -> Self {
         Self {
             approvals,
             token,
+            generation,
             armed: true,
         }
     }
@@ -130,7 +180,9 @@ impl ApprovalGuard {
     /// Retire the prompt now and stand the guard down.
     fn retire(&mut self) {
         if self.armed {
-            self.approvals.lock().retire(&self.token);
+            self.approvals
+                .lock()
+                .retire_generation(&self.token, self.generation);
             self.armed = false;
         }
     }
@@ -1098,16 +1150,25 @@ impl Channel for MattermostChannel {
         );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.approvals.lock().pending.insert(
-            token.clone(),
-            PendingApproval {
-                channel_id: recipient_channel_id(recipient).to_string(),
-                sender: tx,
-            },
-        );
+        let generation = {
+            let mut state = self.approvals.lock();
+            let generation = state.next_generation;
+            state.next_generation += 1;
+            state.pending.insert(
+                token.clone(),
+                PendingApproval {
+                    generation,
+                    channel_id: recipient_channel_id(recipient).to_string(),
+                    sender: tx,
+                },
+            );
+            generation
+        };
         // Armed from here on: every exit below — including a dropped future —
-        // retires the token and any post bound to it.
-        let mut guard = ApprovalGuard::new(Arc::clone(&self.approvals), token.clone());
+        // retires this registration and any post bound to it. Cleanup is keyed
+        // by generation, so a guard outliving its request cannot evict a later
+        // one that drew the same token.
+        let mut guard = ApprovalGuard::new(Arc::clone(&self.approvals), token.clone(), generation);
 
         let post_id = self.create_post(&SendMessage::new(text, recipient)).await?;
 
@@ -1121,7 +1182,7 @@ impl Channel for MattermostChannel {
             self.approvals
                 .lock()
                 .posts
-                .insert(post_id.clone(), token.clone());
+                .insert(post_id.clone(), (token.clone(), generation));
             self.seed_approval_reactions(&post_id).await;
         }
 
@@ -1595,7 +1656,7 @@ impl MattermostChannel {
 
         // Cheap check first: a reaction on any other post is not ours, and
         // rejecting it here keeps unrelated chatter out of the auth logs.
-        let Some(token) = self.approvals.lock().posts.get(post_id).cloned() else {
+        let Some((token, _generation)) = self.approvals.lock().posts.get(post_id).cloned() else {
             return false;
         };
 
@@ -1697,6 +1758,36 @@ impl MattermostChannel {
             .and_then(|channel| channel.as_str())
             .unwrap_or("");
 
+        // Ownership first. A refusal below must never swallow text this channel
+        // has no claim on: with the identity checks ahead of this lookup, an
+        // unresolved bot identity turned *every* six-character approval-shaped
+        // message into `Consumed`, losing unrelated user text instead of
+        // forwarding it. Peeking here is safe even though the decision itself
+        // happens in a later critical section, because a token retired in
+        // between is still recognized through `was_retired`.
+        {
+            let state = self.approvals.lock();
+            if !state.pending.contains_key(&token) && !state.was_retired(&token) {
+                return ApprovalReplyOutcome::NotFound;
+            }
+        }
+
+        // The token is ours, so a decision is genuinely at stake — recover the
+        // identity if the listener started before `/users/me` was reachable.
+        // The listener copies the ID once at startup and never refetches, so
+        // without this a transient lookup failure would leave every typed
+        // approval permanently unanswerable until the daemon was restarted.
+        // Empty results are deliberately not cached, so this recovers as soon as
+        // the endpoint does; a successful lookup is cached and costs nothing
+        // thereafter.
+        let recovered;
+        let bot_user_id = if bot_user_id.is_empty() {
+            recovered = self.get_bot_identity().await.0;
+            recovered.as_str()
+        } else {
+            bot_user_id
+        };
+
         // Identity is checked before the allowlist, not through it. A wildcard
         // peer group matches any string, including the empty one this yields for
         // a malformed event and including the bot's own ID — so consulting the
@@ -1704,11 +1795,10 @@ impl MattermostChannel {
         // live prompt, and would treat "no identity" as "some authorized user".
         //
         // An *unknown* bot ID fails closed rather than skipping the comparison.
-        // `get_bot_identity` yields an empty ID whenever `/users/me` is
-        // unreachable or answers without one, and treating that as "no self-check
-        // needed" would invert the guard exactly when identity is least certain:
-        // under a wildcard peer group the bot's own post would then pass
-        // authorization and approve the tool it had just prompted for.
+        // Treating it as "no self-check needed" would invert the guard exactly
+        // when identity is least certain: under a wildcard peer group the bot's
+        // own post would then pass authorization and approve the tool it had
+        // just prompted for.
         let reason = if user_id.is_empty() {
             Some("missing_author_identity")
         } else if bot_user_id.is_empty() {
@@ -4183,6 +4273,7 @@ mod approval_tests {
         ch.approvals.lock().pending.insert(
             token.to_string(),
             PendingApproval {
+                generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
             },
@@ -4220,7 +4311,7 @@ mod approval_tests {
         ch.approvals
             .lock()
             .posts
-            .insert(post_id.to_string(), token.to_string());
+            .insert(post_id.to_string(), (token.to_string(), 0));
         rx
     }
 
@@ -4792,6 +4883,7 @@ mod approval_lifecycle_tests {
         ch.approvals.lock().pending.insert(
             token.to_string(),
             PendingApproval {
+                generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
             },
@@ -4880,10 +4972,10 @@ mod approval_lifecycle_tests {
         ch.approvals
             .lock()
             .posts
-            .insert("post1".to_string(), "abc123".to_string());
+            .insert("post1".to_string(), ("abc123".to_string(), 0));
 
         {
-            let _guard = ApprovalGuard::new(Arc::clone(&ch.approvals), "abc123".to_string());
+            let _guard = ApprovalGuard::new(Arc::clone(&ch.approvals), "abc123".to_string(), 0);
             assert!(!ch.approvals.lock().pending.is_empty());
         } // dropped here, as an outer timeout would
 
@@ -4910,7 +5002,7 @@ mod approval_lifecycle_tests {
         let ch = channel_with_peers(Vec::new());
         let _rx = pending(&ch, "abc123");
         {
-            let mut guard = ApprovalGuard::new(Arc::clone(&ch.approvals), "abc123".to_string());
+            let mut guard = ApprovalGuard::new(Arc::clone(&ch.approvals), "abc123".to_string(), 0);
             guard.retire();
             // A new request reuses the same token before the guard drops.
             let _reused = pending(&ch, "abc123");
@@ -4983,7 +5075,7 @@ mod approval_lifecycle_tests {
         ch.approvals
             .lock()
             .posts
-            .insert("post1".to_string(), "abc123".to_string());
+            .insert("post1".to_string(), ("abc123".to_string(), 0));
 
         let event = json!({
             "data": {
@@ -5047,6 +5139,7 @@ mod approval_identity_tests {
         ch.approvals.lock().pending.insert(
             token.to_string(),
             PendingApproval {
+                generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
             },
@@ -5102,7 +5195,7 @@ mod approval_identity_tests {
         ch.approvals
             .lock()
             .posts
-            .insert("post1".to_string(), "abc123".to_string());
+            .insert("post1".to_string(), ("abc123".to_string(), 0));
 
         // `get_bot_identity` will fail against this unreachable host, yielding
         // the empty ID this test is about — the same value the listener passes
@@ -5197,6 +5290,205 @@ mod approval_identity_tests {
             ch.bot_identity.get().is_none(),
             "a response with no ID must not populate the identity cache, or the \
              self-approval guard stays disabled for the channel's whole life"
+        );
+    }
+}
+
+/// Regressions for the registration-generation race and the identity-recovery
+/// availability gap raised in review.
+#[cfg(test)]
+mod approval_generation_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ALLOWED_USER: &str = "operator_user_id";
+    const BOT_USER: &str = "bot_user_id";
+    const ORIGIN_CHANNEL: &str = "chan1";
+
+    fn channel(peers: Vec<String>, base_url: String) -> MattermostChannel {
+        MattermostChannel::new(
+            base_url,
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_generation_alias",
+            Arc::new(move || peers.clone()),
+            false,
+            false,
+        )
+    }
+
+    /// Register a prompt the way `request_approval_attributed` does, returning
+    /// the receiver and the generation it was given.
+    fn register(
+        ch: &MattermostChannel,
+        token: &str,
+        post_id: &str,
+    ) -> (tokio::sync::oneshot::Receiver<ChannelApprovalResponse>, u64) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = ch.approvals.lock();
+        let generation = state.next_generation;
+        state.next_generation += 1;
+        state.pending.insert(
+            token.to_string(),
+            PendingApproval {
+                generation,
+                channel_id: ORIGIN_CHANNEL.to_string(),
+                sender: tx,
+            },
+        );
+        state
+            .posts
+            .insert(post_id.to_string(), (token.to_string(), generation));
+        (rx, generation)
+    }
+
+    /// A guard armed for an earlier request must not retire a later request that
+    /// happened to draw the same token.
+    ///
+    /// `new_approval_token` is six random characters — finite, and not a
+    /// uniqueness guarantee. Keying cleanup on the token alone meant a stale
+    /// guard could delete a live prompt's sender and post binding, stranding an
+    /// approval the operator could still see on screen.
+    #[test]
+    fn stale_guard_cannot_retire_a_newer_same_token_registration() {
+        let ch = channel(Vec::new(), "https://mm.example.com".into());
+
+        // Old request registers, and its guard stays armed.
+        let (_old_rx, old_generation) = register(&ch, "abc123", "old_post");
+        let old_guard = ApprovalGuard::new(
+            Arc::clone(&ch.approvals),
+            "abc123".to_string(),
+            old_generation,
+        );
+
+        // The old registration goes away the way a resolving path would retire
+        // it, and a new request then draws the same token.
+        ch.approvals
+            .lock()
+            .retire_generation("abc123", old_generation);
+        let (mut new_rx, new_generation) = register(&ch, "abc123", "new_post");
+        assert_ne!(old_generation, new_generation);
+
+        // The stale guard drops afterwards.
+        drop(old_guard);
+
+        let state = ch.approvals.lock();
+        assert!(
+            state.pending.contains_key("abc123"),
+            "a stale guard must not retire a newer registration's prompt"
+        );
+        assert!(
+            state.posts.contains_key("new_post"),
+            "a stale guard must not drop a newer registration's post binding"
+        );
+        drop(state);
+        assert!(
+            new_rx.try_recv().is_err(),
+            "the newer prompt must still be awaiting a decision, not cancelled"
+        );
+    }
+
+    /// The guard for the *live* registration still cleans up on drop.
+    #[test]
+    fn matching_guard_still_retires_its_own_registration() {
+        let ch = channel(Vec::new(), "https://mm.example.com".into());
+        let (_rx, generation) = register(&ch, "abc123", "post1");
+        drop(ApprovalGuard::new(
+            Arc::clone(&ch.approvals),
+            "abc123".to_string(),
+            generation,
+        ));
+        let state = ch.approvals.lock();
+        assert!(
+            state.pending.is_empty(),
+            "the owning guard must still clean up"
+        );
+        assert!(state.posts.is_empty(), "and must drop its own post binding");
+    }
+
+    /// A transient `/users/me` failure at listener startup must not leave typed
+    /// approvals permanently unanswerable.
+    ///
+    /// Both listeners copy the bot ID once and never refetch, so before this the
+    /// operator had to restart the daemon. The resolver now recovers the
+    /// identity when the copied value is empty; empty results are not cached, so
+    /// the first successful lookup is the one that sticks.
+    #[tokio::test]
+    async fn typed_approval_recovers_after_a_transient_identity_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Fails first, then succeeds — the shape of a listener that started
+        // while Mattermost was briefly unavailable.
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/me"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": BOT_USER, "username": "glados"})),
+            )
+            .mount(&server)
+            .await;
+
+        let ch = channel(vec![ALLOWED_USER.to_string()], server.uri());
+
+        // The listener's startup lookup fails, yielding the empty ID it then
+        // carries into every `process_inbound_post` call.
+        let (startup_id, _) = ch.get_bot_identity().await;
+        assert!(startup_id.is_empty(), "the first lookup must fail");
+
+        let (_rx, _generation) = register(&ch, "abc123", "post1");
+        let outcome = ch
+            .try_resolve_approval_reply(
+                &json!({
+                    "id": "post2",
+                    "user_id": ALLOWED_USER,
+                    "message": "abc123 yes",
+                    "create_at": 1,
+                    "channel_id": ORIGIN_CHANNEL,
+                }),
+                &startup_id,
+            )
+            .await;
+
+        assert_eq!(outcome, ApprovalReplyOutcome::Consumed);
+        assert!(
+            ch.approvals.lock().pending.is_empty(),
+            "the operator must be able to answer once the identity lookup recovers, \
+             without restarting the daemon"
+        );
+    }
+
+    /// A refusal must not swallow text this channel has no claim on.
+    ///
+    /// With the identity checks ahead of the ownership lookup, an unresolved bot
+    /// identity turned every six-character approval-shaped message into
+    /// `Consumed`, losing unrelated user text.
+    #[tokio::test]
+    async fn unknown_token_reaches_the_model_even_when_identity_is_unavailable() {
+        let ch = channel(vec!["*".to_string()], "https://mm.example.com".into());
+        assert_eq!(
+            ch.try_resolve_approval_reply(
+                &json!({
+                    "id": "post1",
+                    "user_id": ALLOWED_USER,
+                    "message": "zzz999 yes",
+                    "create_at": 1,
+                    "channel_id": ORIGIN_CHANNEL,
+                }),
+                "",
+            )
+            .await,
+            ApprovalReplyOutcome::NotFound,
+            "a security refusal must not also lose unrelated user text"
         );
     }
 }
