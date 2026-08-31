@@ -70,25 +70,6 @@ struct ApprovalState {
 }
 
 impl ApprovalState {
-    /// Retire whichever registration currently holds `token`, remembering the
-    /// token so a late-arriving decision for it is still recognized.
-    ///
-    /// Used by the resolving paths, which act on the registration that is live
-    /// *now*. Cancellation cleanup must use [`ApprovalState::retire_generation`]
-    /// instead, so a stale guard cannot evict a newer request.
-    fn retire(&mut self, token: &str) -> Option<PendingApproval> {
-        let generation = self.pending.get(token).map(|pending| pending.generation);
-        match generation {
-            Some(generation) => self.retire_generation(token, generation),
-            None => {
-                // Nothing pending, but the token still has to be remembered:
-                // a decision that arrives after this point is late, not foreign.
-                self.remember_retired(token);
-                None
-            }
-        }
-    }
-
     /// Retire `token` only if the live registration is the one identified by
     /// `generation`.
     ///
@@ -119,6 +100,34 @@ impl ApprovalState {
             }
             self.retired.push_back(token.to_string());
         }
+    }
+
+    /// Draw a token that is neither live nor inside the retired window.
+    ///
+    /// `new_approval_token` is six random characters, so redraws can collide.
+    /// A collision with a *live* token would overwrite another request's
+    /// registration; one with a *retired* token would make that request's late
+    /// decision look like it belongs to this prompt. Both hand authority to the
+    /// wrong request rather than merely denying one, so neither is acceptable.
+    ///
+    /// Returns `None` if no free token is found within the attempt budget. With
+    /// a 36^6 space and a retired window of 64, that means something is very
+    /// wrong, and refusing to prompt is safer than reusing an identity.
+    fn allocate_token(&self) -> Option<String> {
+        const ALLOCATION_ATTEMPTS: usize = 16;
+        (0..ALLOCATION_ATTEMPTS)
+            .map(|_| crate::util::new_approval_token())
+            .find(|token| !self.pending.contains_key(token) && !self.was_retired(token))
+    }
+
+    /// True when `token` is currently held by the registration identified by
+    /// `generation` — the check every decision path makes before acting, so a
+    /// later request that drew the same token cannot receive an older one's
+    /// decision.
+    fn owns(&self, token: &str, generation: u64) -> bool {
+        self.pending
+            .get(token)
+            .is_some_and(|pending| pending.generation == generation)
     }
 
     fn was_retired(&self, token: &str) -> bool {
@@ -1142,16 +1151,19 @@ impl Channel for MattermostChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
-        let token = crate::util::new_approval_token();
-        let text = crate::util::build_yesno_approval_prompt(
-            &token,
-            &request.tool_name,
-            &request.arguments_summary,
-        );
-
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let generation = {
+        // Allocation and registration are one critical section, and the token is
+        // drawn so it collides with neither a live prompt nor one still inside
+        // the retired window. Six random characters are not an identity: a
+        // redraw that lands on a token another request already owns would let a
+        // decision meant for one prompt resolve the other.
+        let (token, generation) = {
             let mut state = self.approvals.lock();
+            let Some(token) = state.allocate_token() else {
+                return Err(anyhow::Error::msg(
+                    "could not allocate a free approval token; too many prompts in flight",
+                ));
+            };
             let generation = state.next_generation;
             state.next_generation += 1;
             state.pending.insert(
@@ -1162,8 +1174,14 @@ impl Channel for MattermostChannel {
                     sender: tx,
                 },
             );
-            generation
+            (token, generation)
         };
+
+        let text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
+        );
         // Armed from here on: every exit below — including a dropped future —
         // retires this registration and any post bound to it. Cleanup is keyed
         // by generation, so a guard outliving its request cannot evict a later
@@ -1179,11 +1197,24 @@ impl Channel for MattermostChannel {
         if self.listen_mode == zeroclaw_config::schema::MattermostListenMode::Websocket
             && !post_id.is_empty()
         {
-            self.approvals
-                .lock()
-                .posts
-                .insert(post_id.clone(), (token.clone(), generation));
-            self.seed_approval_reactions(&post_id).await;
+            // `create_post` awaited, so confirm this registration still owns the
+            // token before binding its post. Binding unconditionally would let a
+            // reaction on this post resolve whichever request holds the token
+            // later, handing one prompt's decision to another.
+            let still_live = {
+                let mut state = self.approvals.lock();
+                if state.owns(&token, generation) {
+                    state
+                        .posts
+                        .insert(post_id.clone(), (token.clone(), generation));
+                    true
+                } else {
+                    false
+                }
+            };
+            if still_live {
+                self.seed_approval_reactions(&post_id).await;
+            }
         }
 
         let attributed =
@@ -1656,7 +1687,7 @@ impl MattermostChannel {
 
         // Cheap check first: a reaction on any other post is not ours, and
         // rejecting it here keeps unrelated chatter out of the auth logs.
-        let Some((token, _generation)) = self.approvals.lock().posts.get(post_id).cloned() else {
+        let Some((token, generation)) = self.approvals.lock().posts.get(post_id).cloned() else {
             return false;
         };
 
@@ -1718,9 +1749,11 @@ impl MattermostChannel {
             return false;
         }
 
-        // Retiring drops the post binding too, so a second tap on the same post
-        // finds nothing rather than a stale token.
-        let Some(pending) = self.approvals.lock().retire(&token) else {
+        // Retire by generation, not by token. This post belongs to one specific
+        // registration; if a later request has since drawn the same token, a tap
+        // on this older, still-visible prompt must not resolve it. Retiring also
+        // drops the post binding, so a second tap finds nothing.
+        let Some(pending) = self.approvals.lock().retire_generation(&token, generation) else {
             return false;
         };
         // A closed receiver means the waiter already timed out; the decision is
@@ -1765,12 +1798,17 @@ impl MattermostChannel {
         // forwarding it. Peeking here is safe even though the decision itself
         // happens in a later critical section, because a token retired in
         // between is still recognized through `was_retired`.
-        {
+        // The observed registration is captured here, not just the fact that the
+        // token is ours. `get_bot_identity` below may await, and a request that
+        // draws this token during that window must not receive this reply.
+        let observed_generation = {
             let state = self.approvals.lock();
-            if !state.pending.contains_key(&token) && !state.was_retired(&token) {
-                return ApprovalReplyOutcome::NotFound;
+            match state.pending.get(&token) {
+                Some(pending) => Some(pending.generation),
+                None if state.was_retired(&token) => None,
+                None => return ApprovalReplyOutcome::NotFound,
             }
-        }
+        };
 
         // The token is ours, so a decision is genuinely at stake — recover the
         // identity if the listener started before `/users/me` was reachable.
@@ -1839,6 +1877,21 @@ impl MattermostChannel {
                 };
             };
 
+            // A different registration holds the token than the one this reply
+            // was recognized against — it was reused while the identity lookup
+            // awaited. The reply is still approval traffic, so it is swallowed,
+            // but it must not answer a prompt it was never shown.
+            if observed_generation != Some(pending.generation) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"token": token})),
+                    "ignoring approval reply whose prompt was replaced by a newer request"
+                );
+                return ApprovalReplyOutcome::Consumed;
+            }
+
             // The reply has to come from the channel the prompt went to. The
             // token is readable by everyone who can see the prompt, and this one
             // channel instance serves many Mattermost channels, so without this
@@ -1878,7 +1931,9 @@ impl MattermostChannel {
 
             (
                 ApprovalReplyOutcome::Consumed,
-                state.retire(&token).map(|pending| pending.sender),
+                observed_generation
+                    .and_then(|generation| state.retire_generation(&token, generation))
+                    .map(|pending| pending.sender),
             )
         };
 
@@ -4904,11 +4959,19 @@ mod approval_lifecycle_tests {
         let rx = pending(&ch, "abc123");
         let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
 
-        // The reaction path answers first and retires the token.
+        // The reaction path answers first and retires the token, the way
+        // production does it — by generation, not by token.
+        let generation = ch
+            .approvals
+            .lock()
+            .pending
+            .get("abc123")
+            .expect("token was live")
+            .generation;
         let resolved = ch
             .approvals
             .lock()
-            .retire("abc123")
+            .retire_generation("abc123", generation)
             .expect("token was live");
         let _ = resolved.sender.send(ChannelApprovalResponse::Approve);
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
@@ -4950,7 +5013,9 @@ mod approval_lifecycle_tests {
     fn retired_token_memory_is_bounded() {
         let ch = channel_with_peers(Vec::new());
         for index in 0..(RETIRED_APPROVAL_TOKENS * 3) {
-            ch.approvals.lock().retire(&format!("tok{index:04}"));
+            ch.approvals
+                .lock()
+                .remember_retired(&format!("tok{index:04}"));
         }
         assert_eq!(
             ch.approvals.lock().retired.len(),
@@ -5489,6 +5554,224 @@ mod approval_generation_tests {
             .await,
             ApprovalReplyOutcome::NotFound,
             "a security refusal must not also lose unrelated user text"
+        );
+    }
+}
+
+/// Registration identity must hold across token allocation, post binding, and
+/// both decision paths — not just guard cleanup.
+///
+/// The six-character token is not a request identity. Where a decision path
+/// acted on the token alone, a later request that drew the same token could
+/// receive a decision made for an earlier prompt: a confused deputy that grants
+/// authority to the wrong request rather than merely denying one.
+#[cfg(test)]
+mod approval_registration_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ALLOWED_USER: &str = "operator_user_id";
+    const BOT_USER: &str = "bot_user_id";
+    const ORIGIN_CHANNEL: &str = "chan1";
+
+    fn channel() -> MattermostChannel {
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_registration_alias",
+            Arc::new(|| vec![ALLOWED_USER.to_string()]),
+            false,
+            false,
+        );
+        let _ = ch
+            .bot_identity
+            .set((BOT_USER.to_string(), "glados".to_string()));
+        ch
+    }
+
+    fn register(
+        ch: &MattermostChannel,
+        token: &str,
+        post_id: Option<&str>,
+    ) -> (tokio::sync::oneshot::Receiver<ChannelApprovalResponse>, u64) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = ch.approvals.lock();
+        let generation = state.next_generation;
+        state.next_generation += 1;
+        state.pending.insert(
+            token.to_string(),
+            PendingApproval {
+                generation,
+                channel_id: ORIGIN_CHANNEL.to_string(),
+                sender: tx,
+            },
+        );
+        if let Some(post_id) = post_id {
+            state
+                .posts
+                .insert(post_id.to_string(), (token.to_string(), generation));
+        }
+        (rx, generation)
+    }
+
+    /// A tap on an older prompt's still-visible post must not answer the newer
+    /// request that has since taken the token.
+    #[tokio::test]
+    async fn reaction_on_an_older_post_cannot_resolve_a_newer_registration() {
+        let ch = channel();
+
+        // Request A registers and binds its post, then goes away.
+        let (_a_rx, a_generation) = register(&ch, "abc123", Some("post_a"));
+        ch.approvals.lock().pending.remove("abc123");
+
+        // Request B draws the same token. A's post binding is still resident.
+        let (mut b_rx, b_generation) = register(&ch, "abc123", None);
+        assert_ne!(a_generation, b_generation);
+
+        let event = json!({
+            "data": {
+                "reaction": json!({
+                    "post_id": "post_a",
+                    "user_id": ALLOWED_USER,
+                    "emoji_name": APPROVAL_EMOJI_APPROVE,
+                })
+                .to_string(),
+            }
+        });
+
+        assert!(
+            !ch.try_resolve_approval_reaction(&event).await,
+            "a reaction on A's post must not resolve B"
+        );
+        assert!(
+            b_rx.try_recv().is_err(),
+            "B must not receive a decision made for A's prompt"
+        );
+        assert!(
+            ch.approvals.lock().owns("abc123", b_generation),
+            "B's registration must survive a tap meant for A"
+        );
+    }
+
+    /// A typed reply recognized against one registration must not resolve a
+    /// different one that took the token while the identity lookup awaited.
+    ///
+    /// The swap has to happen *inside* `get_bot_identity().await` — that is the
+    /// window the reviewer identified — so the mock delays its response while
+    /// the test replaces the registration.
+    #[tokio::test]
+    async fn typed_reply_cannot_resolve_a_registration_that_replaced_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": BOT_USER, "username": "glados"}))
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let ch = Arc::new(MattermostChannel::new(
+            server.uri(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "approval_registration_alias",
+            Arc::new(|| vec![ALLOWED_USER.to_string()]),
+            false,
+            false,
+        ));
+
+        let (_a_rx, a_generation) = register(&ch, "abc123", None);
+
+        // Empty bot ID forces the identity refresh, so the resolver recognizes
+        // A's registration and then awaits the delayed lookup.
+        let resolver = {
+            let ch = Arc::clone(&ch);
+            zeroclaw_spawn::spawn!(async move {
+                ch.try_resolve_approval_reply(
+                    &json!({
+                        "id": "post1",
+                        "user_id": ALLOWED_USER,
+                        "message": "abc123 yes",
+                        "create_at": 1,
+                        "channel_id": ORIGIN_CHANNEL,
+                    }),
+                    "",
+                )
+                .await
+            })
+        };
+
+        // While that await is in flight, A goes away and B takes the token.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ch.approvals
+            .lock()
+            .retire_generation("abc123", a_generation);
+        let (mut b_rx, b_generation) = register(&ch, "abc123", None);
+        assert_ne!(a_generation, b_generation);
+
+        let outcome = resolver.await.expect("resolver task must not panic");
+
+        assert_eq!(
+            outcome,
+            ApprovalReplyOutcome::Consumed,
+            "the reply is approval traffic and must not reach the model"
+        );
+        assert!(
+            b_rx.try_recv().is_err(),
+            "B must not receive a reply written in answer to A's prompt"
+        );
+        assert!(
+            ch.approvals.lock().owns("abc123", b_generation),
+            "B must still be awaiting its own decision"
+        );
+    }
+
+    /// Allocation must not hand out a token that is live or still inside the
+    /// retired window — either collision would let one prompt's decision land
+    /// on another.
+    #[test]
+    fn allocation_skips_live_and_retired_tokens() {
+        let ch = channel();
+        let (_rx, _generation) = register(&ch, "live01", None);
+        ch.approvals.lock().remember_retired("gone02");
+
+        for _ in 0..256 {
+            let token = ch
+                .approvals
+                .lock()
+                .allocate_token()
+                .expect("a free token must be available");
+            assert_ne!(token, "live01", "must not reuse a live token");
+            assert_ne!(
+                token, "gone02",
+                "must not reuse a token in the retired window"
+            );
+        }
+    }
+
+    /// The binding is only added when the registration still owns the token, so
+    /// a prompt posted for a request that has already gone away cannot leave a
+    /// binding that a later request would answer through.
+    #[test]
+    fn post_binding_requires_the_registration_to_still_be_live() {
+        let ch = channel();
+        let (_rx, generation) = register(&ch, "abc123", None);
+        ch.approvals.lock().retire_generation("abc123", generation);
+
+        let state = ch.approvals.lock();
+        assert!(
+            !state.owns("abc123", generation),
+            "the registration is gone, so `owns` must gate the binding out"
         );
     }
 }
