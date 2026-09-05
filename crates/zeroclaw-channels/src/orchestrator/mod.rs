@@ -6662,10 +6662,15 @@ async fn process_channel_message_body(
     // Ask the delivering channel what this room is for. Channels that do not
     // implement it, and aliases that have not opted in, return `None`, so the
     // prompt is unchanged unless an operator asked for this.
+    //
+    // Keyed on `reply_target`, not `channel`: the latter is the channel *type*
+    // (`"mattermost"`), the same for every room, so it can never identify one.
+    // `reply_target` is the adapter's own addressing string for the room this
+    // message arrived in, and the adapter is what parses it.
     let room_purpose = ctx
         .channels_by_name
         .get(&channel_composite)
-        .and_then(|channel| channel.room_context(&msg.channel))
+        .and_then(|channel| channel.room_context(&msg.reply_target))
         .and_then(|context| context.purpose);
     let base_system_prompt = system_prompt_for_channel_turn(
         ctx.as_ref(),

@@ -1187,6 +1187,10 @@ impl Channel for MattermostChannel {
         if !self.purpose_as_instructions {
             return None;
         }
+        // The caller passes this channel's own addressing string, which for a
+        // threaded reply is `channel_id:root_id`. Purposes are per room, not
+        // per thread, so strip the thread half before looking one up.
+        let room_id = recipient_channel_id(room_id);
         let purpose = self.room_purposes.lock().get(room_id).cloned()?;
         let context = zeroclaw_api::channel::ChannelRoomContext {
             purpose: Some(purpose),
@@ -5989,6 +5993,43 @@ mod channel_purpose_plumbing_tests {
         ));
         assert!(ch.room_purposes.lock().is_empty(), "nothing may be cached");
         assert!(ch.room_context("room1").is_none());
+    }
+
+    /// The lookup key is this channel's own addressing string, not a bare room
+    /// ID, and for a threaded reply that string is `channel_id:root_id`.
+    ///
+    /// The first version of this feature looked the purpose up by
+    /// `ChannelMessage::channel`, which for Mattermost is the constant
+    /// `"mattermost"` rather than a room, so no room ever matched and the
+    /// purpose silently never reached the prompt. Every test then passed a bare
+    /// room ID directly, so none of them noticed.
+    #[test]
+    fn room_context_accepts_the_channels_own_addressing_string() {
+        let ch = channel(true);
+        ch.refresh_room_purposes(&filter_discovered_channels(
+            &discovered("Arch packaging"),
+            &[],
+            true,
+        ));
+
+        // Plain room, exactly as `reply_target` carries it for a top-level post.
+        assert_eq!(
+            ch.room_context("room1").and_then(|c| c.purpose).as_deref(),
+            Some("Arch packaging")
+        );
+        // Threaded reply: purposes are per room, so the thread half is stripped.
+        assert_eq!(
+            ch.room_context("room1:root_post_id")
+                .and_then(|c| c.purpose)
+                .as_deref(),
+            Some("Arch packaging"),
+            "a threaded reply is still in the room the prompt belongs to"
+        );
+        // The channel *type* is not a room and must never resolve.
+        assert!(
+            ch.room_context("mattermost").is_none(),
+            "the channel type is not a room identifier"
+        );
     }
 
     /// A purpose cleared in Mattermost must stop being injected: the refresh

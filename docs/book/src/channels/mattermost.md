@@ -125,6 +125,12 @@ granted to **every channel member**, usually a wider group than whoever
 controls this config. Enabling this lets all of them steer the agent's focus in
 that room. Check your permission scheme if that is not what you want.
 
+Mattermost caps a channel purpose at **250 characters** (the header field
+allows 1024). That is enough for a focused description of the room, not for a
+full prompt, so treat it as a short steer rather than somewhere to write
+instructions at length. The cap is enforced by Mattermost itself, so no
+truncation happens on this side.
+
 An edited purpose takes effect on the next message, with a delay that depends
 on `listen_mode`:
 
