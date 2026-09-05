@@ -16296,6 +16296,17 @@ pub struct MattermostConfig {
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Inject each room's Mattermost channel purpose into the system prompt as
+    /// channel-supplied context, letting one room specialise the agent.
+    ///
+    /// Off by default. The purpose is editable by anyone holding
+    /// `manage_*_channel_properties`, which on default permission schemes is
+    /// every channel member, so enabling this lets them steer the agent's
+    /// focus. The injected text cannot grant capabilities or override the
+    /// agent's rules.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub purpose_as_instructions: bool,
 }
 
 impl Default for MattermostConfig {
@@ -16318,6 +16329,7 @@ impl Default for MattermostConfig {
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             approval_timeout_secs: default_channel_approval_timeout_secs(),
+            purpose_as_instructions: false,
         }
     }
 }
