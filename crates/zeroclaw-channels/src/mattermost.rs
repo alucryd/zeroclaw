@@ -448,6 +448,21 @@ impl MattermostChannel {
                     .map(|purpose| (target.id.clone(), purpose.clone()))
             })
             .collect();
+        // The whole feature is silent when it does not work: a missing purpose
+        // looks exactly like a room that has none. Report what discovery
+        // actually found so an operator can tell "no purpose set" from "the
+        // purpose never reached us".
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "rooms_discovered": targets.len(),
+                    "rooms_with_purpose": refreshed.len(),
+                })
+            ),
+            "Refreshed Mattermost room purposes"
+        );
         *self.room_purposes.lock() = refreshed;
     }
 
@@ -1191,7 +1206,23 @@ impl Channel for MattermostChannel {
         // threaded reply is `channel_id:root_id`. Purposes are per room, not
         // per thread, so strip the thread half before looking one up.
         let room_id = recipient_channel_id(room_id);
-        let purpose = self.room_purposes.lock().get(room_id).cloned()?;
+        let purpose = {
+            let purposes = self.room_purposes.lock();
+            let found = purposes.get(room_id).cloned();
+            if found.is_none() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "alias": self.alias,
+                            "room_id": room_id,
+                            "cached_rooms": purposes.len(),
+                        })),
+                    "No cached Mattermost purpose for this room"
+                );
+            }
+            found?
+        };
         let context = zeroclaw_api::channel::ChannelRoomContext {
             purpose: Some(purpose),
         };
