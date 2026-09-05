@@ -3139,6 +3139,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 approval_timeout_secs: 300,
+                purpose_as_instructions: false,
             },
         );
         assert!(has_supervised_channels(&config));

@@ -97,6 +97,49 @@ Decisions are final: removing a reaction does not retract an answer, and the fir
 
 If the bot cannot place the emoji, most often a permissions problem, it logs `failed to seed Mattermost approval reaction` at `WARN` and the prompt still works by reply.
 
+## Channel purpose as instructions (`purpose_as_instructions`)
+
+Off by default. When enabled, each room's Mattermost **channel purpose** is
+injected into the agent's system prompt as channel-supplied context, so one
+room can specialise the agent without a config entry per room:
+
+```toml
+[channels.mattermost.default]
+purpose_as_instructions = true
+```
+
+Set a channel's purpose to describe what that room is for, such as "Arch Linux
+package maintenance for the AUR repos". The agent treats it as authoritative
+about the room's focus, tone, and which skills to reach for.
+
+It is **not** authoritative over the agent's rules. The injected text is
+labelled as channel-supplied and explicitly denied any power to grant
+capabilities, relax restrictions, or override operating rules; where it
+conflicts with them, the rules win. It cannot enable a tool, widen a peer
+group, or change an autonomy level.
+
+Consider who can edit it before enabling. The purpose is governed by
+Mattermost's `manage_public_channel_properties` /
+`manage_private_channel_properties` permissions, which on default schemes are
+granted to **every channel member**, usually a wider group than whoever
+controls this config. Enabling this lets all of them steer the agent's focus in
+that room. Check your permission scheme if that is not what you want.
+
+An edited purpose takes effect on the next message, with a delay that depends
+on `listen_mode`:
+
+| `listen_mode` | Purpose edit takes effect |
+|---|---|
+| `websocket` | Almost immediately, from the `channel_updated` event |
+| `polling` | On the next message after the 60-second discovery refresh |
+
+Clearing a channel's purpose stops the injection; it is not retained from a
+previous value. Rooms with no purpose contribute nothing.
+
+To roll back, set `purpose_as_instructions = false` (or remove the field; off is
+the default). No channel state needs cleaning up, because nothing is cached for
+an alias that has not opted in.
+
 ## Direct messages
 
 Mattermost classifies channels by `type`:
