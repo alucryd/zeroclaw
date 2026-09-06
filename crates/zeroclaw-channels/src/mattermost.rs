@@ -741,6 +741,32 @@ impl MattermostChannel {
     /// Get the bot's own user ID and username so we can ignore our own messages
     /// and detect @-mentions by username. Result cached on the channel
     /// so `self_handle` / `self_addressed_mention` can read it sync.
+    /// The authenticated bot identity, or an error when it cannot be resolved.
+    ///
+    /// A listener cannot run safely without this. Every inbound post is checked
+    /// against the bot's own user ID to keep the bot from answering itself, and
+    /// an empty ID matches nothing, so that check silently passes for every post
+    /// the bot authored. Under a wildcard peer group and the default
+    /// `mention_only = false`, the bot's own approval prompt would then be
+    /// admitted as ordinary model input, feeding a security prompt's token and
+    /// tool details back into the conversation.
+    ///
+    /// Failing rather than degrading is deliberate. The supervised listener
+    /// retries with backoff, so a transient outage of Mattermost's
+    /// authenticated-account endpoint resolves itself, while a durable one keeps
+    /// the channel visibly down instead of quietly unsafe.
+    async fn require_bot_identity(&self) -> Result<(String, String)> {
+        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+        if bot_user_id.is_empty() {
+            bail!(
+                "Mattermost bot identity unavailable: the authenticated-account endpoint \
+                 returned no user id; refusing to listen, because without it the bot cannot \
+                 tell its own posts from an operator's"
+            );
+        }
+        Ok((bot_user_id, bot_username))
+    }
+
     async fn get_bot_identity(&self) -> (String, String) {
         if let Some(cached) = self.bot_identity.get() {
             return cached.clone();
@@ -1244,7 +1270,7 @@ impl MattermostChannel {
     async fn listen_polling(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         // Resolve auth up front so misconfiguration fails fast at listen-time.
         let initial_token = self.token().await?.to_string();
-        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+        let (bot_user_id, bot_username) = self.require_bot_identity().await?;
 
         let auto_discover = self.scoped_channel_ids().is_none();
         let mut target_channels = self.list_target_channels().await?;
@@ -1338,7 +1364,7 @@ impl MattermostChannel {
 
     async fn listen_websocket(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         let token = self.token().await?.to_string();
-        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+        let (bot_user_id, bot_username) = self.require_bot_identity().await?;
         let auto_discover = self.scoped_channel_ids().is_none();
         let target_channels = self.list_target_channels().await?;
         let mut channel_direct_map: HashMap<String, bool> = target_channels
@@ -2054,6 +2080,27 @@ impl MattermostChannel {
         let text = post.get("message").and_then(|m| m.as_str()).unwrap_or("");
         let create_at = post.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0);
         let root_id = post.get("root_id").and_then(|r| r.as_str()).unwrap_or("");
+
+        // Without a bot identity the self-loop check below cannot be enforced:
+        // an empty `bot_user_id` equals no real author, so every post the bot
+        // wrote would pass it. Refuse to admit anything rather than admit the
+        // bot's own posts.
+        //
+        // `require_bot_identity` already prevents a listener from running in
+        // this state, so in production this is unreachable. It is kept as the
+        // second half of the boundary: the guarantee then belongs to the
+        // admission path itself rather than to a precondition a future caller
+        // might bypass.
+        if bot_user_id.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"alias": self.alias, "post_id": id})),
+                "refusing to admit a Mattermost post without a known bot identity"
+            );
+            return None;
+        }
 
         if user_id == bot_user_id || create_at <= last_create_at {
             return None;
@@ -5659,26 +5706,58 @@ mod approval_registration_identity_tests {
     /// A typed reply recognized against one registration must not resolve a
     /// different one that took the token while the identity lookup awaited.
     ///
-    /// The swap has to happen *inside* `get_bot_identity().await` — that is the
-    /// window the reviewer identified — so the mock delays its response while
-    /// the test replaces the registration.
+    /// The swap must happen *inside* `get_bot_identity().await`, and that
+    /// ordering is enforced rather than timed: the mock responder performs the
+    /// swap itself, so the identity request cannot complete until the
+    /// replacement has already happened. An earlier version slept 50ms and
+    /// hoped, which proves nothing under unusual scheduling.
     #[tokio::test]
     async fn typed_reply_cannot_resolve_a_registration_that_replaced_it() {
         use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v4/users/me"))
-            .respond_with(
+        /// Swaps the registration while serving the identity lookup, which is
+        /// exactly the window under test.
+        struct SwapDuringLookup {
+            approvals: Arc<Mutex<ApprovalState>>,
+            old_generation: u64,
+            replacement: Mutex<Option<tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>,
+        }
+
+        impl Respond for SwapDuringLookup {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                let mut state = self.approvals.lock();
+                state.retire_generation("abc123", self.old_generation);
+                let generation = state.next_generation;
+                state.next_generation += 1;
+                let sender = self
+                    .replacement
+                    .lock()
+                    .take()
+                    .expect("the identity lookup runs once");
+                state.pending.insert(
+                    "abc123".to_string(),
+                    PendingApproval {
+                        generation,
+                        channel_id: ORIGIN_CHANNEL.to_string(),
+                        sender,
+                    },
+                );
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"id": BOT_USER, "username": "glados"}))
-                    .set_delay(Duration::from_millis(300)),
-            )
-            .mount(&server)
-            .await;
+            }
+        }
 
-        let ch = Arc::new(MattermostChannel::new(
+        // The server starts first so the channel can be built against its real
+        // URI: there must be exactly one `ApprovalState`, shared by the channel
+        // and the responder. An earlier version built the channel first and
+        // copied the state into a second `Arc`, so the swap mutated a map the
+        // resolver never read and the test passed without proving anything.
+        let server = MockServer::start().await;
+
+        // Deliberately not `channel_at`: that seeds the identity cache, and a
+        // seeded cache would skip the refresh this test depends on.
+        let ch = MattermostChannel::new(
             server.uri(),
             Some("token".into()),
             None,
@@ -5688,38 +5767,32 @@ mod approval_registration_identity_tests {
             Arc::new(|| vec![ALLOWED_USER.to_string()]),
             false,
             false,
-        ));
-
+        );
         let (_a_rx, a_generation) = register(&ch, "abc123", None);
+        let (b_tx, mut b_rx) = tokio::sync::oneshot::channel();
 
-        // Empty bot ID forces the identity refresh, so the resolver recognizes
-        // A's registration and then awaits the delayed lookup.
-        let resolver = {
-            let ch = Arc::clone(&ch);
-            zeroclaw_spawn::spawn!(async move {
-                ch.try_resolve_approval_reply(
-                    &json!({
-                        "id": "post1",
-                        "user_id": ALLOWED_USER,
-                        "message": "abc123 yes",
-                        "create_at": 1,
-                        "channel_id": ORIGIN_CHANNEL,
-                    }),
-                    "",
-                )
-                .await
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/me"))
+            .respond_with(SwapDuringLookup {
+                approvals: Arc::clone(&ch.approvals),
+                old_generation: a_generation,
+                replacement: Mutex::new(Some(b_tx)),
             })
-        };
+            .mount(&server)
+            .await;
 
-        // While that await is in flight, A goes away and B takes the token.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        ch.approvals
-            .lock()
-            .retire_generation("abc123", a_generation);
-        let (mut b_rx, b_generation) = register(&ch, "abc123", None);
-        assert_ne!(a_generation, b_generation);
-
-        let outcome = resolver.await.expect("resolver task must not panic");
+        let outcome = ch
+            .try_resolve_approval_reply(
+                &json!({
+                    "id": "post1",
+                    "user_id": ALLOWED_USER,
+                    "message": "abc123 yes",
+                    "create_at": 1,
+                    "channel_id": ORIGIN_CHANNEL,
+                }),
+                "",
+            )
+            .await;
 
         assert_eq!(
             outcome,
@@ -5729,10 +5802,6 @@ mod approval_registration_identity_tests {
         assert!(
             b_rx.try_recv().is_err(),
             "B must not receive a reply written in answer to A's prompt"
-        );
-        assert!(
-            ch.approvals.lock().owns("abc123", b_generation),
-            "B must still be awaiting its own decision"
         );
     }
 
@@ -5772,6 +5841,186 @@ mod approval_registration_identity_tests {
         assert!(
             !state.owns("abc123", generation),
             "the registration is gone, so `owns` must gate the binding out"
+        );
+    }
+}
+
+/// A listener must not run, and a post must not be admitted, while the bot's
+/// own identity is unknown.
+///
+/// The approval resolver already refuses to *decide* without an identity, but
+/// the prompt the bot posts is not approval-shaped, so it takes the ordinary
+/// parser path instead. There the self-loop check compares the author against
+/// `bot_user_id`; an empty one matches nothing, so under a wildcard peer group
+/// and the default `mention_only = false` the bot's own security prompt was
+/// admitted as model input, carrying its token and tool details back into the
+/// conversation.
+#[cfg(test)]
+mod bot_identity_admission_tests {
+    use super::*;
+    use serde_json::json;
+
+    const BOT_USER: &str = "bot_user_id";
+    const OPERATOR: &str = "operator_user_id";
+    const ORIGIN_CHANNEL: &str = "chan1";
+
+    /// Wildcard peers and `mention_only = false`: the documented configuration
+    /// in which nothing else would stop a bot-authored post.
+    fn wildcard_channel() -> MattermostChannel {
+        MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "identity_admission_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+    }
+
+    fn post_from(user_id: &str, message: &str) -> serde_json::Value {
+        json!({
+            "id": "post1",
+            "user_id": user_id,
+            "message": message,
+            "create_at": 10,
+            "channel_id": ORIGIN_CHANNEL,
+        })
+    }
+
+    /// The exact reported shape: the bot's own approval prompt, arriving while
+    /// the startup identity snapshot is empty.
+    #[tokio::test]
+    async fn bot_authored_prompt_is_not_admitted_when_identity_is_unknown() {
+        let ch = wildcard_channel();
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        ch.process_inbound_post(
+            &post_from(
+                BOT_USER,
+                "APPROVAL REQUIRED [abc123]\nTool: shell\nArgs: rm -rf /",
+            ),
+            "", // the empty snapshot a failed identity lookup produces
+            "glados",
+            0,
+            ORIGIN_CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        assert!(
+            inbound.try_recv().is_err(),
+            "the bot's own approval prompt must never be fed back as model input"
+        );
+    }
+
+    /// Not specific to approval prompts: with no identity, no post is safe to
+    /// admit, because none of them can be checked against the bot.
+    #[tokio::test]
+    async fn no_post_is_admitted_when_identity_is_unknown() {
+        let ch = wildcard_channel();
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        ch.process_inbound_post(
+            &post_from(OPERATOR, "what is the weather"),
+            "",
+            "glados",
+            0,
+            ORIGIN_CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        assert!(
+            inbound.try_recv().is_err(),
+            "admission must fail closed rather than guess"
+        );
+    }
+
+    /// The counterweight the review asked for: once identity is known, an
+    /// ordinary operator message must still get through. Without this, "fail
+    /// closed" could be satisfied by suppressing everything.
+    #[tokio::test]
+    async fn operator_message_is_admitted_once_identity_is_known() {
+        let ch = wildcard_channel();
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        ch.process_inbound_post(
+            &post_from(OPERATOR, "what is the weather"),
+            BOT_USER,
+            "glados",
+            0,
+            ORIGIN_CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        let message = inbound
+            .try_recv()
+            .expect("a real operator message must still reach the model");
+        assert_eq!(message.content, "what is the weather");
+    }
+
+    /// And the self-loop check still holds when identity *is* known, so the
+    /// guard above did not replace it.
+    #[tokio::test]
+    async fn bot_authored_post_stays_rejected_when_identity_is_known() {
+        let ch = wildcard_channel();
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        ch.process_inbound_post(
+            &post_from(BOT_USER, "APPROVAL REQUIRED [abc123]"),
+            BOT_USER,
+            "glados",
+            0,
+            ORIGIN_CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        assert!(inbound.try_recv().is_err());
+    }
+
+    /// A listener must refuse to start rather than run blind. The supervised
+    /// listener retries with backoff, so a transient outage recovers on its own
+    /// while a durable one keeps the channel visibly down.
+    #[tokio::test]
+    async fn listener_refuses_to_start_without_a_bot_identity() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/me"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let ch = MattermostChannel::new(
+            server.uri(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "identity_admission_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        );
+
+        let error = ch
+            .require_bot_identity()
+            .await
+            .expect_err("an unavailable identity must not yield a usable listener");
+        assert!(
+            format!("{error}").contains("identity unavailable"),
+            "the error must name the cause; got: {error}"
         );
     }
 }
