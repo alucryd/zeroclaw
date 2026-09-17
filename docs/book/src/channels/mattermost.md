@@ -118,18 +118,45 @@ capabilities, relax restrictions, or override operating rules; where it
 conflicts with them, the rules win. It cannot enable a tool, widen a peer
 group, or change an autonomy level.
 
-Consider who can edit it before enabling. The purpose is governed by
-Mattermost's `manage_public_channel_properties` /
-`manage_private_channel_properties` permissions, which on default schemes are
-granted to **every channel member**, usually a wider group than whoever
-controls this config. Enabling this lets all of them steer the agent's focus in
-that room. Check your permission scheme if that is not what you want.
+### What enabling this grants, and to whom
 
-Mattermost caps a channel purpose at **250 characters** (the header field
-allows 1024). That is enough for a focused description of the room, not for a
-full prompt, so treat it as a short steer rather than somewhere to write
-instructions at length. The cap is enforced by Mattermost itself, so no
-truncation happens on this side.
+Turning this on is a trust decision, and it is worth being blunt about its
+shape rather than leaving it to be inferred from the warning above.
+
+The purpose is governed by Mattermost's `manage_public_channel_properties` /
+`manage_private_channel_properties` permissions, which on default schemes are
+granted to **every channel member**. That is usually a wider group than whoever
+controls this config, and it need not overlap with the alias's `peer_groups` at
+all: a member who is not an authorized ZeroClaw peer, and so cannot get the
+agent to answer them directly, can still edit the room's purpose.
+
+The text reaches the system prompt. The framing around it tells the model the
+text is channel-supplied, describes the room rather than commanding the agent,
+and never overrides its rules. But framing is a strong prior, not a boundary.
+Text that reads as an instruction can influence what the agent does in that
+room, and no amount of escaping changes that; it is natural language, and the
+model reads it as such.
+
+**So the decision this feature makes, explicitly:** enabling
+`purpose_as_instructions` for an alias grants everyone who can edit those rooms'
+purposes the ability to steer the agent there, within the permissions the agent
+already has. Enable it only where that set of people is trusted with the agent's
+configured capabilities. If it is not, leave it off (off is the default), or
+restrict `manage_*_channel_properties` in your permission scheme to the people
+who should have it.
+
+What the purpose still cannot do is *widen* those capabilities. It cannot enable
+a tool, add a peer, change an autonomy level, or approve its own tool call:
+those are decided by config and by the approval path, neither of which reads
+prompt text.
+
+Structurally the text is contained. Before injection it is flattened to a single
+line with angle brackets and control characters removed, so it cannot close its
+own section, open another, or forge a Markdown heading that reads like a
+different part of the operator's prompt. It is also capped at 500 characters,
+above Mattermost's own **250-character** limit for the field (the channel header
+allows 1024), so no legitimate purpose is cut while a compromised server cannot
+paste a whole prompt.
 
 An edited purpose takes effect on the next message, with a delay that depends
 on `listen_mode`:

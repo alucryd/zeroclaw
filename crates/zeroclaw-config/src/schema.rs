@@ -16299,11 +16299,17 @@ pub struct MattermostConfig {
     /// Inject each room's Mattermost channel purpose into the system prompt as
     /// channel-supplied context, letting one room specialise the agent.
     ///
-    /// Off by default. The purpose is editable by anyone holding
-    /// `manage_*_channel_properties`, which on default permission schemes is
-    /// every channel member, so enabling this lets them steer the agent's
-    /// focus. The injected text cannot grant capabilities or override the
-    /// agent's rules.
+    /// Off by default, because enabling it is a trust decision: the purpose is
+    /// editable by anyone holding `manage_*_channel_properties`, which on
+    /// default permission schemes is every channel member, and the text reaches
+    /// the system prompt. Those editors can therefore steer the agent in that
+    /// room, including with text that reads as an instruction, and they need
+    /// not be authorized ZeroClaw peers.
+    ///
+    /// What that steering cannot do is exceed the agent's existing permissions:
+    /// prompt text grants no tool, widens no peer group, and changes no
+    /// autonomy level. Enable this only where the room's editors are trusted
+    /// with the agent's configured capabilities.
     #[tab(Behavior)]
     #[serde(default)]
     pub purpose_as_instructions: bool,
