@@ -4,6 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
+use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_providers::ChatMessage;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -324,6 +325,28 @@ pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     history.iter().map(estimate_message_tokens).sum()
 }
 
+/// Estimate the token cost of the tool schemas that ride along with the
+/// history in every request.
+///
+/// These are not messages, so they are invisible to `estimate_history_tokens`,
+/// but the provider counts them against the same context window. With native
+/// tool calling and a full registry they are worth thousands of tokens, so a
+/// history budget that ignores them overflows a window it believes it fits.
+///
+/// Measured from the serialized schema — what actually goes on the wire —
+/// with the same ~4 chars/token heuristic the history estimate uses, plus a
+/// few framing tokens per tool for the name/description wrapper.
+pub fn estimate_tool_spec_tokens(specs: &[ToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(|spec| {
+            let schema_len = serde_json::to_string(&spec.parameters)
+                .map_or_else(|_| spec.parameters.to_string().len(), |json| json.len());
+            (spec.name.len() + spec.description.len() + schema_len).div_ceil(4) + 4
+        })
+        .sum()
+}
+
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
@@ -522,6 +545,45 @@ mod tests {
 
         assert_eq!(floor_char_boundary(text, 5), 3);
         assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
+    }
+
+    /// The schemas are what a history-only budget misses, so the estimate has
+    /// to scale with them rather than treating tools as free.
+    #[test]
+    fn tool_spec_estimate_grows_with_the_schema_it_measures() {
+        let small = ToolSpec {
+            name: "pwd".into(),
+            description: "Print the working directory".into(),
+            parameters: std::sync::Arc::new(serde_json::json!({"type": "object"})),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
+        };
+        let large = ToolSpec {
+            parameters: std::sync::Arc::new(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command to run"},
+                    "timeout": {"type": "integer", "description": "Seconds before giving up"},
+                },
+                "required": ["command"],
+            })),
+            ..small.clone()
+        };
+
+        assert!(
+            estimate_tool_spec_tokens(std::slice::from_ref(&large))
+                > estimate_tool_spec_tokens(&[small]),
+            "a richer schema must cost more than a bare one"
+        );
+        assert_eq!(
+            estimate_tool_spec_tokens(&[]),
+            0,
+            "no tools must cost nothing, so prompt-guided turns are unaffected"
+        );
+        assert!(
+            estimate_tool_spec_tokens(&[large.clone(), large]) > 2 * 4,
+            "a registry's worth of schemas must be material next to a context budget"
+        );
     }
 
     #[test]
