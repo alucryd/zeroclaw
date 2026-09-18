@@ -16303,6 +16303,23 @@ pub struct MattermostConfig {
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Inject each room's Mattermost channel purpose into the system prompt as
+    /// channel-supplied context, letting one room specialise the agent.
+    ///
+    /// Off by default, because enabling it is a trust decision: the purpose is
+    /// editable by anyone holding `manage_*_channel_properties`, which on
+    /// default permission schemes is every channel member, and the text reaches
+    /// the system prompt. Those editors can therefore steer the agent in that
+    /// room, including with text that reads as an instruction, and they need
+    /// not be authorized ZeroClaw peers.
+    ///
+    /// What that steering cannot do is exceed the agent's existing permissions:
+    /// prompt text grants no tool, widens no peer group, and changes no
+    /// autonomy level. Enable this only where the room's editors are trusted
+    /// with the agent's configured capabilities.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub purpose_as_instructions: bool,
 }
 
 impl Default for MattermostConfig {
@@ -16325,6 +16342,7 @@ impl Default for MattermostConfig {
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             approval_timeout_secs: default_channel_approval_timeout_secs(),
+            purpose_as_instructions: false,
         }
     }
 }
