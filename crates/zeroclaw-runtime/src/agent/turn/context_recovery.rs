@@ -80,12 +80,19 @@ pub(crate) async fn try_recover_context_overflow(
         let tokens_now = estimate_history_tokens(history);
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
-        let result = trim_to_recent_turns(owned, budget);
-        let trimmed = result.trimmed;
+        let mut result = trim_to_recent_turns(owned, budget);
+        // A turn whose own tool results exceed the window has no older turn to
+        // drop, so whole-turn trimming reports failure and the retry would
+        // resend byte-for-byte what the provider just rejected. Shrinking the
+        // results is the only move left that still makes progress.
+        let compacted =
+            crate::agent::history_trim::compact_tool_results_to_budget(&mut result.history, budget);
+        let dropped_whole_turns = result.trimmed;
+        let trimmed = dropped_whole_turns || compacted > 0;
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
         let kept_turns = result.kept_turns;
-        let tokens_after = result.tokens_after;
+        let tokens_after = result.tokens_after.saturating_sub(compacted);
         let mut recovered_history = result.history;
         if trimmed {
             // Announce compaction only once the trim has actually succeeded.
@@ -96,12 +103,16 @@ pub(crate) async fn try_recover_context_overflow(
             // Insert the same model-visible breadcrumb the turn-boundary path
             // uses, after the leading system messages, so the retried provider
             // call tells the model earlier turns were dropped (never silent to
-            // the model, not just to clients).
-            let system_count = recovered_history
-                .iter()
-                .take_while(|m| m.role == "system")
-                .count();
-            recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
+            // the model, not just to clients). Only when turns were actually
+            // dropped: a compaction-only recovery cut nothing whole, and the
+            // truncation markers already say what was shortened.
+            if dropped_whole_turns {
+                let system_count = recovered_history
+                    .iter()
+                    .take_while(|m| m.role == "system")
+                    .count();
+                recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
+            }
         }
         *history = recovered_history;
         if trimmed {

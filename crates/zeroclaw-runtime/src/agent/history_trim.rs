@@ -210,6 +210,97 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
     }
 }
 
+/// Floor on what a compacted tool result keeps, so shrinking never erases the
+/// evidence that the call happened or what it was about.
+const MIN_TOOL_RESULT_CHARS: usize = 400;
+
+/// Rough width of the `[... N characters truncated ...]` marker plus its
+/// surrounding blank lines, charged against each cut so a pass always shrinks.
+const TRUNCATION_MARKER_CHARS: usize = 96;
+
+/// Bound on the re-measure loop below. Convergence is normally one or two
+/// passes; the cap is there so a pathological history cannot spin.
+const MAX_COMPACTION_PASSES: usize = 4;
+
+/// Last resort when dropping whole turns cannot reach the budget: shrink the
+/// largest tool results that remain, in place, largest first.
+///
+/// [`trim_to_recent_turns`] deliberately keeps the most recent turn whole, so a
+/// turn whose own tool results exceed the budget is untrimmable — the common
+/// shape being one `git diff` or file read larger than the window. Whole-turn
+/// trimming then reports "cannot trim further" and the request goes out over
+/// the limit anyway.
+///
+/// Shrinking is done by re-truncating the message content, which keeps every
+/// message in place: a `tool_call` never loses its result, so no pairing is
+/// orphaned. The truncation marker stays model-visible, so the model is told
+/// its output was cut rather than silently seeing less than it produced.
+///
+/// Returns the estimated tokens reclaimed.
+pub fn compact_tool_results_to_budget(history: &mut [ChatMessage], budget_tokens: usize) -> usize {
+    if budget_tokens == 0 {
+        return 0;
+    }
+    let before = estimate_history_tokens(history);
+    if before <= budget_tokens {
+        return 0;
+    }
+
+    // Largest first: one oversized result is the usual cause, and cutting it
+    // alone leaves the rest of the turn readable.
+    let mut candidates: Vec<usize> = (0..history.len())
+        .filter(|&index| is_tool_result(&history[index]))
+        .collect();
+    candidates.sort_by_key(|&index| std::cmp::Reverse(history[index].content.len()));
+
+    // Each pass shrinks by the measured shortfall, but the truncation marker
+    // and the per-message framing overhead mean a pass can land just over the
+    // line. Re-measure and go again rather than shipping a near miss; passes
+    // stop as soon as one makes no progress.
+    for _ in 0..MAX_COMPACTION_PASSES {
+        let current = estimate_history_tokens(history);
+        if current <= budget_tokens {
+            break;
+        }
+        let mut excess_chars = (current - budget_tokens).saturating_mul(4);
+        let mut progressed = false;
+        for &index in &candidates {
+            if excess_chars == 0 {
+                break;
+            }
+            let length = history[index].content.len();
+            let Some(removable) = length.checked_sub(MIN_TOOL_RESULT_CHARS) else {
+                continue;
+            };
+            // Cut the marker's own cost on top of the shortfall. Without it a
+            // small overshoot is uncuttable: asking to remove 16 characters
+            // while the marker adds ~30 leaves the message no smaller, the
+            // pass reports no progress, and the request goes out still over.
+            let target =
+                length - removable.min(excess_chars.saturating_add(TRUNCATION_MARKER_CHARS));
+            let compacted =
+                crate::agent::history::truncate_tool_message(&history[index].content, target);
+            // The marker costs characters of its own, so credit what the swap
+            // actually saved rather than what was asked for.
+            let saved = length.saturating_sub(compacted.len());
+            excess_chars = excess_chars.saturating_sub(saved);
+            progressed |= saved > 0;
+            history[index].content = compacted;
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    before.saturating_sub(estimate_history_tokens(history))
+}
+
+/// A tool result in either transport: native tool-role messages, and the
+/// text-protocol fallback that folds results into a user message.
+fn is_tool_result(msg: &ChatMessage) -> bool {
+    msg.role == "tool" || (msg.role == "user" && msg.content.starts_with(TOOL_RESULTS_PREFIX))
+}
+
 pub fn trim_to_reported_budget(
     history: Vec<ChatMessage>,
     budget_tokens: usize,
@@ -951,6 +1042,63 @@ mod tests {
         let r = trim_to_reported_budget(h, budget, reported);
         assert!(r.trimmed, "extreme ratio must still enforce, not no-op");
         assert!(r.history.iter().any(|m| m.content.contains("recent short")));
+    }
+
+    /// The case whole-turn trimming cannot reach: one turn, one huge result.
+    #[test]
+    fn compaction_fits_a_single_turn_that_cannot_be_trimmed() {
+        let mut history = vec![
+            sys("system"),
+            user("run the thing"),
+            asst("calling the tool"),
+            tool(&"x".repeat(40_000)),
+        ];
+        let budget = 1_000;
+
+        // Precondition: the turn-based path is powerless here, which is why
+        // this compaction exists at all.
+        let untrimmable = trim_to_recent_turns(history.clone(), budget);
+        assert!(
+            !untrimmable.trimmed,
+            "a single turn must be untrimmable, or this test proves nothing"
+        );
+
+        let reclaimed = compact_tool_results_to_budget(&mut history, budget);
+
+        assert!(reclaimed > 0, "compaction must reclaim something");
+        assert!(
+            estimate_history_tokens(&history) <= budget,
+            "the history must end up inside the budget, not merely smaller"
+        );
+        assert_eq!(history.len(), 4, "no message may be dropped by compaction");
+        assert!(
+            history[3].content.contains("characters truncated"),
+            "the model must be told its result was cut"
+        );
+    }
+
+    /// Compaction must not eat the conversation around the oversized result,
+    /// and must leave enough of it to stay meaningful.
+    #[test]
+    fn compaction_spares_short_messages_and_keeps_a_readable_floor() {
+        let mut history = vec![
+            sys("system"),
+            user("run the thing"),
+            tool("tiny result"),
+            tool(&"x".repeat(40_000)),
+        ];
+
+        compact_tool_results_to_budget(&mut history, 200);
+
+        assert_eq!(
+            history[2].content, "tiny result",
+            "a result already below the floor must be left alone"
+        );
+        assert!(
+            history[3].content.len() >= MIN_TOOL_RESULT_CHARS,
+            "the compacted result must keep the floor's worth of content"
+        );
+        assert_eq!(history[1].content, "run the thing", "prose is not a target");
     }
 
     #[test]
