@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["breadcrumb","compact_tool_results_to_budget","insert_breadcrumb_deduped","trim_to_recent_turns","trim_to_reported_budget"],"struct":["TrimResult"]};
