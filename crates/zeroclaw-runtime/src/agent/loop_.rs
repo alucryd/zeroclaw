@@ -21109,6 +21109,27 @@ Let me check the result."#;
                 .expect("capacity failure must retain its typed cause");
             assert_eq!(exceeded.model_context_window, capacity);
             assert!(exceeded.estimated_tokens > capacity);
+            // The shares are what lets an operator see what filled the window.
+            assert!(
+                exceeded.system_tokens > 0,
+                "the request's system prompt must be accounted for"
+            );
+            if matches!(scenario, HookBudgetScenario::SummaryFloor) {
+                assert_eq!(
+                    exceeded.tool_schema_tokens, 0,
+                    "the graceful summary is tools-free, so no schema share"
+                );
+            } else {
+                assert!(
+                    exceeded.tool_schema_tokens > 0,
+                    "a native-tools request must report its schema share"
+                );
+            }
+            // Raw shares are parts of the raw total, and calibration only
+            // ever scales that total up, so they can never exceed it.
+            assert!(
+                exceeded.system_tokens + exceeded.tool_schema_tokens <= exceeded.estimated_tokens
+            );
         } else {
             let text = result.expect("request must fit");
             if summary {
