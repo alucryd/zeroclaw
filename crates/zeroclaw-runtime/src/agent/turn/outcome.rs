@@ -60,6 +60,38 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 pub struct ContextWindowExceeded {
     pub estimated_tokens: usize,
     pub model_context_window: usize,
+    /// Raw estimate of the leading system messages' share of the request.
+    pub system_tokens: usize,
+    /// Raw estimate of the native tool schemas' share of the request; `0`
+    /// when the request carried no native tools.
+    pub tool_schema_tokens: usize,
+}
+
+impl ContextWindowExceeded {
+    /// Operator-facing account of what filled the window.
+    ///
+    /// The `Display` text is the localized user-facing remediation and
+    /// deliberately carries no numbers, which left the operator's own log line
+    /// empty: the one place the cause should be recoverable said nothing. The
+    /// shares are raw estimates; `estimated_tokens` may also be calibrated
+    /// against provider-reported usage, so the conversation share is the
+    /// remainder and absorbs that correction.
+    #[must_use]
+    pub fn breakdown(&self) -> String {
+        let conversation = self
+            .estimated_tokens
+            .saturating_sub(self.system_tokens)
+            .saturating_sub(self.tool_schema_tokens);
+        format!(
+            "context window exceeded: ~{} tokens against a {}-token window \
+             (system prompt ~{}, tool schemas ~{}, conversation ~{}); request not sent",
+            self.estimated_tokens,
+            self.model_context_window,
+            self.system_tokens,
+            self.tool_schema_tokens,
+            conversation,
+        )
+    }
 }
 
 impl std::fmt::Display for ContextWindowExceeded {
@@ -440,6 +472,8 @@ mod tests {
         let error = anyhow::Error::new(ContextWindowExceeded {
             estimated_tokens: 40_000,
             model_context_window: 32_768,
+            system_tokens: 6_000,
+            tool_schema_tokens: 9_000,
         })
         .context("private prompt and provider diagnostics");
         let exceeded = context_window_exceeded_from_error(&error).expect("typed inner cause");
@@ -459,6 +493,42 @@ mod tests {
         let untyped = anyhow::Error::msg("context window exceeded");
         assert!(context_window_exceeded_from_error(&untyped).is_none());
         assert!(terminal_completion_error_message(&untyped, None).is_none());
+    }
+
+    /// The operator line must say what filled the window. An empty cause is
+    /// what made a long-running failure unrecoverable from the journal.
+    #[test]
+    fn context_window_breakdown_names_every_share_and_the_window() {
+        let exceeded = ContextWindowExceeded {
+            estimated_tokens: 132_000,
+            model_context_window: 131_072,
+            system_tokens: 13_400,
+            tool_schema_tokens: 11_000,
+        };
+        let line = exceeded.breakdown();
+        for expected in [
+            "~132000 tokens",
+            "131072-token window",
+            "system prompt ~13400",
+            "tool schemas ~11000",
+            "conversation ~107600",
+            "request not sent",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in {line:?}");
+        }
+    }
+
+    /// Shares larger than the total (possible when the raw estimates disagree
+    /// with a calibrated total) must clamp rather than underflow.
+    #[test]
+    fn context_window_breakdown_never_underflows() {
+        let exceeded = ContextWindowExceeded {
+            estimated_tokens: 100,
+            model_context_window: 50,
+            system_tokens: 80,
+            tool_schema_tokens: 80,
+        };
+        assert!(exceeded.breakdown().contains("conversation ~0"));
     }
 
     #[test]
