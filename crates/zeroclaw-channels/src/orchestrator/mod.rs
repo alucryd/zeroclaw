@@ -10881,6 +10881,7 @@ async fn process_channel_message_body(
                     error_attributes["error_kind"] = "context_window_exceeded".into();
                     error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
                     error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
                     error_attributes["system_tokens"] = exceeded.system_tokens.into();
                     error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
                     error_attributes["provider_attempted"] = false.into();
@@ -19814,6 +19815,7 @@ pub(crate) mod tests {
         let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
             model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
             system_tokens: 0,
             tool_schema_tokens: 0,
         })

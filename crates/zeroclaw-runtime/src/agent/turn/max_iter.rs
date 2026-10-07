@@ -346,6 +346,7 @@ pub(crate) async fn finish_after_max_iterations(
                         tokens,
                         token_counter.source(),
                         (
+                            crate::agent::history::estimate_history_tokens(&messages),
                             crate::agent::history::estimate_system_floor_tokens(&messages),
                             0,
                         ),

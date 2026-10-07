@@ -21126,9 +21126,15 @@ Let me check the result."#;
                 );
             }
             // Raw shares are parts of the raw total, and calibration only
-            // ever scales that total up, so they can never exceed it.
+            // ever scales that total up, so neither ordering can invert.
             assert!(
-                exceeded.system_tokens + exceeded.tool_schema_tokens <= exceeded.estimated_tokens
+                exceeded.system_tokens + exceeded.tool_schema_tokens
+                    <= exceeded.raw_estimated_tokens,
+                "the shares must be parts of the raw total"
+            );
+            assert!(
+                exceeded.raw_estimated_tokens <= exceeded.estimated_tokens,
+                "calibration only ever scales the total up"
             );
         } else {
             let text = result.expect("request must fit");
