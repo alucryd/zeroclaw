@@ -8184,6 +8184,10 @@ pub struct WssConfig {
     /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
     /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
     /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// When the listeners are reached over Tailscale (`tunnel_provider =
+    /// "tailscale"`, or a `[wss]`/`[enroll]` bind on a tailnet address), the
+    /// node's MagicDNS name, short name, and tailnet IPs are added automatically
+    /// at startup; list them here only to pin names tailscaled does not report.
     /// Ignored when you bring your own server certificate via `cert_path`.
     #[serde(default)]
     pub sans: Vec<String>,
@@ -8241,6 +8245,25 @@ impl Default for WssConfig {
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
         }
+    }
+}
+
+impl WssClientAuthConfig {
+    /// The operator-provided (bring-your-own) CA that verifies client
+    /// certificates, when one is in effect: client auth enabled with a CA path.
+    /// In that mode the daemon holds no CA signing key, so it verifies clients
+    /// but cannot issue certificates and does not run the enrollment endpoint.
+    pub fn external_ca_path(&self) -> Option<&str> {
+        (self.enabled && !self.ca_cert_path.is_empty()).then_some(self.ca_cert_path.as_str())
+    }
+}
+
+impl WssConfig {
+    /// See [`WssClientAuthConfig::external_ca_path`].
+    pub fn external_client_ca(&self) -> Option<&str> {
+        self.client_auth
+            .as_ref()
+            .and_then(WssClientAuthConfig::external_ca_path)
     }
 }
 

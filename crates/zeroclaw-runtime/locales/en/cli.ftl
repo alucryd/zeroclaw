@@ -1312,6 +1312,7 @@ cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short
 cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
 cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough): {$endpoint}
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
