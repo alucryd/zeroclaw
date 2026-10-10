@@ -105,6 +105,57 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
     }
 }
 
+/// Whether a risk profile admits `tool`: not excluded, and listed when the
+/// profile restricts tools to an allow-list. The same rule gates
+/// `spawn_subagent` itself and the model choice a routed spawn makes.
+fn risk_profile_admits(rp: &zeroclaw_config::schema::RiskProfileConfig, tool: &str) -> bool {
+    !rp.excluded_tools.iter().any(|t| t == tool)
+        && rp
+            .effective_allowed_tools()
+            .is_none_or(|tools| tools.iter().any(|t| t == tool))
+}
+
+/// Whether the parent may choose its child's model, judged exactly as its own
+/// `model_switch` call would be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteAuthorization {
+    Allowed,
+    /// The profile does not admit `model_switch`, or the agent cannot act.
+    NotPermitted,
+    /// Admitted, but switching models requires an approval this tool cannot
+    /// obtain on the operator's behalf.
+    NeedsApproval,
+}
+
+/// A route sends the child's requests, including anything the parent puts in
+/// its prompt, to another provider. Being allowed to spawn is not permission
+/// to choose that provider: a private agent that may not switch models must
+/// not reach a route declared for another agent through its subagents.
+///
+/// Approval is decided by the same `ApprovalManager` rule `model_switch`
+/// itself is subject to, so `always_ask` wins even under Full autonomy. When
+/// switching would need a prompt, the routed spawn is refused rather than
+/// allowed through on `spawn_subagent`'s own approval: an auto-approved spawn
+/// must not stand in for a switch the operator asked to approve. A fresh
+/// manager carries no session "always" grants, so this errs towards refusal.
+fn route_authorization(config: &Config, parent_alias: &str) -> RouteAuthorization {
+    use crate::approval::{ApprovalManager, ApprovalRequirement};
+    use crate::tools::model_switch::ModelSwitchTool;
+
+    let Some(rp) = config.risk_profile_for_agent(parent_alias) else {
+        return RouteAuthorization::NotPermitted;
+    };
+    if rp.level == zeroclaw_config::autonomy::AutonomyLevel::ReadOnly
+        || !risk_profile_admits(rp, ModelSwitchTool::NAME)
+    {
+        return RouteAuthorization::NotPermitted;
+    }
+    match ApprovalManager::from_risk_profile(rp).approval_requirement(ModelSwitchTool::NAME) {
+        ApprovalRequirement::Prompt => RouteAuthorization::NeedsApproval,
+        _ => RouteAuthorization::Allowed,
+    }
+}
+
 /// Resolve an optional `model_hint` argument to the `(model_provider, model)`
 /// pair of an operator-declared `[[model_routes]]` entry.
 ///
@@ -203,7 +254,11 @@ impl Tool for SpawnSubagentTool {
             .iter()
             .map(|route| route.hint.as_str())
             .collect();
-        if !hints.is_empty() {
+        // Also offered only to a parent that may choose a model at all; the
+        // execute path re-checks against the admitted config regardless.
+        if !hints.is_empty()
+            && route_authorization(&self.config, &self.parent_alias) == RouteAuthorization::Allowed
+        {
             schema["properties"]["model_hint"] = json!({
                 "type": "string",
                 "enum": hints,
@@ -251,21 +306,17 @@ impl Tool for SpawnSubagentTool {
             .map(|admission| admission.config())
             .unwrap_or_else(|| Arc::clone(&self.config));
         let risk_profile = config.risk_profile_for_agent(&self.parent_alias);
-        if let Some(rp) = risk_profile {
-            let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");
-            let allowed_when_listed = rp
-                .effective_allowed_tools()
-                .is_none_or(|tools| tools.iter().any(|t| t == "spawn_subagent"));
-            if excluded || !allowed_when_listed {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "spawn_subagent: refused — agent '{}' risk_profile does not list spawn_subagent in allowed_tools",
-                        self.parent_alias
-                    )),
-                });
-            }
+        if let Some(rp) = risk_profile
+            && !risk_profile_admits(rp, Self::NAME)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "spawn_subagent: refused — agent '{}' risk_profile does not list spawn_subagent in allowed_tools",
+                    self.parent_alias
+                )),
+            });
         }
 
         // Argument validation surfaces as a structured `ToolResult`
@@ -298,6 +349,24 @@ impl Tool for SpawnSubagentTool {
                 });
             }
         };
+        if route.is_some() {
+            let refusal = match route_authorization(&config, &self.parent_alias) {
+                RouteAuthorization::Allowed => None,
+                RouteAuthorization::NotPermitted => {
+                    Some("tool-spawn-subagent-error-model-hint-not-permitted")
+                }
+                RouteAuthorization::NeedsApproval => {
+                    Some("tool-spawn-subagent-error-model-hint-needs-approval")
+                }
+            };
+            if let Some(key) = refusal {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(key)),
+                });
+            }
+        }
         let (provider_override, model_override) = route.unzip();
 
         if let Err(error) = self
@@ -910,6 +979,9 @@ mod tests {
         );
     }
 
+    /// An agent with one declared route that is also allowed to choose a
+    /// model: `model_switch` auto-approved, which the default Supervised
+    /// profile does not do on its own.
     fn config_with_route(alias: &str, hint: &str) -> Config {
         let mut config = config_with_agent(alias);
         config
@@ -920,7 +992,101 @@ mod tests {
                 model: "light-model".into(),
                 ..Default::default()
             });
+        authorize_model_switch(&mut config);
         config
+    }
+
+    fn authorize_model_switch(config: &mut Config) {
+        config
+            .risk_profiles
+            .get_mut("default")
+            .expect("fixture profile")
+            .auto_approve
+            .push("model_switch".into());
+    }
+
+    fn profile(config: &mut Config) -> &mut RiskProfileConfig {
+        config
+            .risk_profiles
+            .get_mut("default")
+            .expect("fixture profile")
+    }
+
+    /// The parent's own `model_switch` authority decides whether it may pick a
+    /// route, through the same admission and approval rules that call obeys.
+    #[test]
+    fn route_authorization_follows_the_parents_model_switch_authority() {
+        use zeroclaw_config::autonomy::AutonomyLevel;
+
+        let mut config = config_with_route("alpha", "light");
+        assert_eq!(
+            route_authorization(&config, "alpha"),
+            RouteAuthorization::Allowed
+        );
+
+        // Supervised default: switching is admitted but needs a prompt.
+        let mut supervised = config_with_agent("alpha");
+        assert_eq!(
+            route_authorization(&supervised, "alpha"),
+            RouteAuthorization::NeedsApproval
+        );
+
+        // always_ask wins even under Full autonomy and over auto_approve.
+        profile(&mut config).level = AutonomyLevel::Full;
+        profile(&mut config).always_ask.push("model_switch".into());
+        assert_eq!(
+            route_authorization(&config, "alpha"),
+            RouteAuthorization::NeedsApproval
+        );
+
+        // Excluded, or absent from an allow-list: not permitted at all.
+        profile(&mut supervised)
+            .excluded_tools
+            .push("model_switch".into());
+        assert_eq!(
+            route_authorization(&supervised, "alpha"),
+            RouteAuthorization::NotPermitted
+        );
+        let mut listed = config_with_route("alpha", "light");
+        profile(&mut listed).allowed_tools = vec!["file_read".into(), "spawn_subagent".into()];
+        assert_eq!(
+            route_authorization(&listed, "alpha"),
+            RouteAuthorization::NotPermitted
+        );
+
+        // A read-only agent cannot act, so it cannot choose a provider either.
+        let mut read_only = config_with_route("alpha", "light");
+        profile(&mut read_only).level = AutonomyLevel::ReadOnly;
+        assert_eq!(
+            route_authorization(&read_only, "alpha"),
+            RouteAuthorization::NotPermitted
+        );
+    }
+
+    /// A parent that may not choose a model is never offered the parameter,
+    /// even when routes exist.
+    #[test]
+    fn the_schema_hides_model_hint_from_a_parent_that_may_not_switch() {
+        let mut config = config_with_agent("alpha");
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "light".into(),
+                model_provider: "custom.light".into(),
+                model: "light-model".into(),
+                ..Default::default()
+            });
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        assert!(
+            tool.parameters_schema()["properties"]
+                .get("model_hint")
+                .is_none(),
+            "a parent needing approval to switch must not be offered routes"
+        );
     }
 
     /// Only an absent key or `null` means "no hint". `null` is how many
@@ -1054,6 +1220,191 @@ mod tests {
             Some(crate::i18n::get_required_cli_string(
                 "tool-spawn-subagent-error-model-hint-invalid"
             ))
+        );
+    }
+
+    /// What one stub provider received: request headers and JSON bodies.
+    type Received = Arc<std::sync::Mutex<Vec<(axum::http::HeaderMap, serde_json::Value)>>>;
+
+    /// An OpenAI-compatible stub that records every chat request and answers
+    /// "done", so a real child run completes against it.
+    async fn recording_provider() -> (String, Received, tokio::task::JoinHandle<()>) {
+        use axum::{Router, extract::State, routing::post};
+
+        async fn record(
+            State(received): State<Received>,
+            headers: axum::http::HeaderMap,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::Json<serde_json::Value> {
+            received.lock().unwrap().push((headers, body));
+            axum::Json(json!({"choices": [{"message": {"content": "done"}}]}))
+        }
+
+        let received: Received = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub provider should bind");
+        let addr = listener.local_addr().expect("stub provider address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(record))
+            .with_state(Arc::clone(&received));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub provider runs");
+        });
+        (format!("http://{addr}"), received, server)
+    }
+
+    /// A real parent with its own provider and one route to another, run
+    /// under temp dirs so the child's `agent::run` writes nowhere real.
+    fn routed_dispatch_config(tmp: &std::path::Path, parent_uri: &str, route_uri: &str) -> Config {
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let mut config = Config {
+            data_dir: tmp.join("data"),
+            config_path: tmp.join("config.toml"),
+            ..config_with_agent("alpha")
+        };
+        config.providers.models.ollama.insert(
+            "parent".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("parent-model".into()),
+                    uri: Some(parent_uri.into()),
+                    timeout_secs: Some(5),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "light".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("light-model".into()),
+                    uri: Some(route_uri.into()),
+                    timeout_secs: Some(5),
+                    temperature: Some(0.25),
+                    extra_headers: [("x-route-option".to_string(), "light".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("fixture agent")
+            .model_provider = "ollama.parent".into();
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "light".into(),
+                model_provider: "ollama.light".into(),
+                model: "light-model".into(),
+                ..Default::default()
+            });
+        config
+    }
+
+    async fn spawn_routed(config: Config) -> ToolResult {
+        let security =
+            SecurityPolicy::for_agent(&config, "alpha").expect("fixture policy resolves");
+        SpawnSubagentTool::new(Arc::new(config), "alpha", Arc::new(security))
+            .execute(json!({"prompt": "list the changed files", "model_hint": "light"}))
+            .await
+            .expect("execute returns a structured result")
+    }
+
+    /// Through production dispatch: an authorized route sends the child's
+    /// requests to the route's provider, carrying that provider's own
+    /// options, and nothing to the parent's.
+    #[tokio::test]
+    async fn an_authorized_route_reaches_the_routes_provider_with_its_options() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (parent_uri, parent_received, parent_server) = recording_provider().await;
+        let (route_uri, route_received, route_server) = recording_provider().await;
+        let mut config = routed_dispatch_config(tmp.path(), &parent_uri, &route_uri);
+        authorize_model_switch(&mut config);
+
+        let result = spawn_routed(config).await;
+        parent_server.abort();
+        route_server.abort();
+
+        assert!(result.success, "routed child should complete: {result:?}");
+        let route = route_received.lock().unwrap();
+        assert!(
+            !route.is_empty(),
+            "the route's provider must receive the child"
+        );
+        for (headers, body) in route.iter() {
+            assert_eq!(body["model"], "light-model");
+            assert_eq!(body["temperature"], 0.25, "the route's temperature applies");
+            assert_eq!(
+                headers.get("x-route-option").map(|v| v.to_str().unwrap()),
+                Some("light"),
+                "a provider-owned option of the route must reach the wire"
+            );
+        }
+        assert!(
+            parent_received.lock().unwrap().is_empty(),
+            "a routed child must not call the parent's provider"
+        );
+    }
+
+    /// The reported gap: a parent that may not switch models must not reach
+    /// another provider through a subagent. Nothing is sent anywhere.
+    #[tokio::test]
+    async fn a_denied_route_sends_no_request_to_the_alternate_provider() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (parent_uri, parent_received, parent_server) = recording_provider().await;
+        let (route_uri, route_received, route_server) = recording_provider().await;
+
+        // Excluded outright, and separately: admitted but `always_ask`, which
+        // an auto-approved spawn must not stand in for.
+        let mut excluded = routed_dispatch_config(tmp.path(), &parent_uri, &route_uri);
+        profile(&mut excluded)
+            .excluded_tools
+            .push("model_switch".into());
+        let mut always_ask = routed_dispatch_config(tmp.path(), &parent_uri, &route_uri);
+        authorize_model_switch(&mut always_ask);
+        profile(&mut always_ask)
+            .auto_approve
+            .push("spawn_subagent".into());
+        profile(&mut always_ask)
+            .always_ask
+            .push("model_switch".into());
+
+        for (config, key) in [
+            (
+                excluded,
+                "tool-spawn-subagent-error-model-hint-not-permitted",
+            ),
+            (
+                always_ask,
+                "tool-spawn-subagent-error-model-hint-needs-approval",
+            ),
+        ] {
+            let result = spawn_routed(config).await;
+            assert!(!result.success, "{key}: the routed spawn must be refused");
+            assert_eq!(
+                result.error,
+                Some(crate::i18n::get_required_cli_string(key))
+            );
+        }
+        parent_server.abort();
+        route_server.abort();
+
+        assert!(
+            route_received.lock().unwrap().is_empty(),
+            "a denied route must send nothing to the alternate provider"
+        );
+        assert!(
+            parent_received.lock().unwrap().is_empty(),
+            "the refusal precedes spawning, so no child runs at all"
         );
     }
 }

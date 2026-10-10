@@ -69,12 +69,25 @@ is working on. Every option owned by the route's provider applies, including
 alias of the same model useful for broad, mechanical passes while the parent
 keeps a higher one for the work that needs it.
 
-The route list is the whole permission. The tool offers `model_hint` only when
-routes exist, enumerates exactly the declared hints, and refuses any other value
-before spawning, rather than silently falling back to the parent's model. A
-SubAgent can read everything its parent can, so a route is the operator stating
-that this provider may see that workspace. Declare routes only to providers you
-would trust with the parent's own context.
+Choosing a route takes two permissions, and both must hold:
+
+- **The route exists.** The tool enumerates exactly the declared hints and
+  refuses any other value, including a blank or malformed one, before
+  spawning, rather than silently falling back to the parent's model.
+- **The parent may switch models.** A route sends the child's requests, and
+  anything the parent writes into its prompt, to another provider. So the
+  parent's risk profile must admit `model_switch`, and switching must not
+  require approval: an `always_ask` entry for `model_switch`, or a Supervised
+  profile that does not auto-approve it, refuses the routed spawn. Being allowed
+  to spawn does not stand in for that approval. Unhinted spawning is unaffected.
+
+The tool offers `model_hint` only to a parent that holds both. To let an agent
+use routes, add `model_switch` to its risk profile's `auto_approve` list (and to
+`allowed_tools`, if that profile restricts tools), or run it under Full autonomy
+without `model_switch` in `always_ask`.
+
+Declare routes only to providers you would trust with the context of every
+agent allowed to choose them.
 
 ## What gets delivered back upstream
 

@@ -1172,6 +1172,8 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在
 tool-spawn-subagent-error-model-hint-invalid = spawn_subagent：model_hint 必须是指向已配置路由的非空字符串；省略它即可使用此代理自身的模型运行。
 tool-spawn-subagent-error-model-hint-unknown = spawn_subagent：未知的 model_hint“{ $hint }”；已配置的提示：{ $hints }
 tool-spawn-subagent-error-model-hint-no-routes = spawn_subagent：未知的 model_hint“{ $hint }”；未配置任何 [[model_routes]]，因此子代理使用此代理自身的模型运行。
+tool-spawn-subagent-error-model-hint-not-permitted = spawn_subagent：model_hint 用于选择子代理的模型，但此代理的风险配置不允许切换模型（model_switch）；省略它即可使用此代理自身的模型运行。
+tool-spawn-subagent-error-model-hint-needs-approval = spawn_subagent：model_hint 用于选择子代理的模型，但此代理切换模型（model_switch）需要审批，而启动子代理无法授予该审批；省略它即可使用此代理自身的模型运行。
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。
