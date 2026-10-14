@@ -138,6 +138,10 @@ enum RouteAuthorization {
 /// allowed through on `spawn_subagent`'s own approval: an auto-approved spawn
 /// must not stand in for a switch the operator asked to approve. A fresh
 /// manager carries no session "always" grants, so this errs towards refusal.
+///
+/// The profile is not the whole boundary: an SOP step (headless or live) may
+/// enforce a narrower tool scope. A step that denies `model_switch` cannot
+/// choose a model directly, so it cannot choose one for its child either.
 fn route_authorization(config: &Config, parent_alias: &str) -> RouteAuthorization {
     use crate::approval::{ApprovalManager, ApprovalRequirement};
     use crate::tools::model_switch::ModelSwitchTool;
@@ -145,7 +149,15 @@ fn route_authorization(config: &Config, parent_alias: &str) -> RouteAuthorizatio
     let Some(rp) = config.risk_profile_for_agent(parent_alias) else {
         return RouteAuthorization::NotPermitted;
     };
-    if rp.level == zeroclaw_config::autonomy::AutonomyLevel::ReadOnly
+    let step_denies_switch =
+        crate::sop::active_scope::active_headless_step_scope().is_some_and(|scope| {
+            scope
+                .excluded(&[ModelSwitchTool::NAME.to_string()])
+                .iter()
+                .any(|tool| tool == ModelSwitchTool::NAME)
+        });
+    if step_denies_switch
+        || rp.level == zeroclaw_config::autonomy::AutonomyLevel::ReadOnly
         || !risk_profile_admits(rp, ModelSwitchTool::NAME)
     {
         return RouteAuthorization::NotPermitted;
@@ -1405,6 +1417,83 @@ mod tests {
         assert!(
             parent_received.lock().unwrap().is_empty(),
             "the refusal precedes spawning, so no child runs at all"
+        );
+    }
+
+    /// The profile allows and auto-approves switching, but the enforced step
+    /// the parent is running denies `model_switch` while permitting spawning.
+    /// The step cannot switch directly, so it cannot route a child either:
+    /// the route's provider would receive the step's data in the prompt.
+    /// Unhinted spawning stays available on the parent's own model.
+    #[tokio::test]
+    async fn a_step_that_denies_model_switch_cannot_route_a_child() {
+        use crate::sop::{SopStep, StepToolScope};
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let (parent_uri, parent_received, parent_server) = recording_provider().await;
+        let (route_uri, route_received, route_server) = recording_provider().await;
+        let mut config = routed_dispatch_config(tmp.path(), &parent_uri, &route_uri);
+        authorize_model_switch(&mut config);
+        let step = || crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: SopStep {
+                number: 1,
+                scope: Some(StepToolScope {
+                    allow: None,
+                    deny: vec!["model_switch".into()],
+                }),
+                ..SopStep::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..Default::default()
+            },
+        };
+        let security =
+            Arc::new(SecurityPolicy::for_agent(&config, "alpha").expect("fixture policy resolves"));
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha", security);
+
+        let (routed, unhinted) =
+            crate::sop::active_scope::with_active_headless_step_scope(step(), async {
+                (
+                    tool.execute(json!({"prompt": "summarize", "model_hint": "light"}))
+                        .await
+                        .expect("structured result"),
+                    tool.execute(json!({"prompt": "summarize"}))
+                        .await
+                        .expect("structured result"),
+                )
+            })
+            .await;
+        let schema = crate::sop::active_scope::with_active_headless_step_scope(step(), async {
+            tool.parameters_schema()
+        })
+        .await;
+        parent_server.abort();
+        route_server.abort();
+
+        assert_eq!(
+            routed.error,
+            Some(crate::i18n::get_required_cli_string(
+                "tool-spawn-subagent-error-model-hint-not-permitted"
+            )),
+            "the step's denial of model_switch must refuse the route"
+        );
+        assert!(
+            route_received.lock().unwrap().is_empty(),
+            "nothing may reach the alternate provider from a step that may not switch"
+        );
+        assert!(
+            schema["properties"].get("model_hint").is_none(),
+            "the step must not be offered routes"
+        );
+        assert!(
+            unhinted.success,
+            "unhinted spawning stays available: {unhinted:?}"
+        );
+        assert!(
+            !parent_received.lock().unwrap().is_empty(),
+            "the unhinted child runs on the parent's provider"
         );
     }
 }

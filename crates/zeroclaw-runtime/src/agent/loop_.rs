@@ -4157,6 +4157,7 @@ mod tests {
     zeroclaw_api::mock_tool_attribution!(
         ActivatingTool,
         CountingTool,
+        ScopeProbe,
         CredentialOutputTool,
         EmptySuccessTool,
         RecordingArgsTool,
@@ -8434,6 +8435,17 @@ mod tests {
                     reasoning_content: None,
                 },
                 ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "step-probe".to_string(),
+                        name: "scope_probe".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
                     text: Some("step recovered".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8464,7 +8476,7 @@ mod tests {
                 title: "Scoped".to_string(),
                 body: "Use only allowed tools".to_string(),
                 scope: Some(crate::sop::StepToolScope {
-                    allow: Some(vec!["allowed_tool".to_string()]),
+                    allow: Some(vec!["allowed_tool".to_string(), "scope_probe".to_string()]),
                     deny: Vec::new(),
                 }),
                 ..crate::sop::SopStep::default()
@@ -8487,6 +8499,7 @@ mod tests {
 
         let allowed_invocations = Arc::new(AtomicUsize::new(0));
         let denied_invocations = Arc::new(AtomicUsize::new(0));
+        let seen_scope = Arc::new(std::sync::Mutex::new(None));
         let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
             Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
             Box::new(CountingTool::new(
@@ -8497,6 +8510,9 @@ mod tests {
                 "denied_tool",
                 Arc::clone(&denied_invocations),
             )),
+            Box::new(ScopeProbe {
+                seen: Arc::clone(&seen_scope),
+            }),
         ]);
 
         let mut history = vec![
@@ -8572,6 +8588,21 @@ mod tests {
             "denied tool call should be recorded as unavailable in history: {history:?}"
         );
 
+        // A tool running inside the live step sees the step's boundary, as on
+        // the headless path: spawn_subagent and delegate read it there to keep
+        // their children (and any model they choose) inside it.
+        let seen = seen_scope
+            .lock()
+            .unwrap()
+            .take()
+            .expect("a tool inside a live step must see the step scope");
+        let excluded = seen.excluded(&["denied_tool".to_string(), "model_switch".to_string()]);
+        assert!(
+            excluded.iter().any(|t| t == "denied_tool")
+                && excluded.iter().any(|t| t == "model_switch"),
+            "the visible scope must carry the step's exclusions, got {excluded:?}"
+        );
+
         let started = sop_started_run_id_from_history(&history)
             .expect("sop_execute tool result should include a run id");
         let engine = engine.lock().unwrap();
@@ -8581,6 +8612,39 @@ mod tests {
         assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
         assert_eq!(run.step_results.len(), 1);
         assert_eq!(run.step_results[0].output, "step recovered");
+    }
+
+    /// Records the SOP step scope in force on the task when called.
+    struct ScopeProbe {
+        seen: Arc<std::sync::Mutex<Option<crate::sop::active_scope::HeadlessStepScope>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ScopeProbe {
+        fn name(&self) -> &str {
+            "scope_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records the active step scope"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.seen.lock().expect("probe lock") =
+                crate::sop::active_scope::active_headless_step_scope();
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "probed".into(),
+                error: None,
+            })
+        }
     }
 
     /// Activates a deferred tool into the shared set when called, standing in

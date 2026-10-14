@@ -79,7 +79,9 @@ Choosing a route takes two permissions, and both must hold:
   parent's risk profile must admit `model_switch`, and switching must not
   require approval: an `always_ask` entry for `model_switch`, or a Supervised
   profile that does not auto-approve it, refuses the routed spawn. Being allowed
-  to spawn does not stand in for that approval. Unhinted spawning is unaffected.
+  to spawn does not stand in for that approval. Inside an SOP step, headless or
+  live, an enforced step scope that excludes `model_switch` refuses the routed
+  spawn too, whatever the profile allows. Unhinted spawning is unaffected.
 
 The tool offers `model_hint` only to a parent that holds both. To let an agent
 use routes, add `model_switch` to its risk profile's `auto_approve` list (and to
