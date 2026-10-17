@@ -230,6 +230,14 @@ impl Tool for ArcToolRef {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.0.execute_with_context(args, context).await
+    }
 }
 
 /// Serply credential override state for `WebSearchTool`.
@@ -315,6 +323,14 @@ impl Tool for ArcDelegatingTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_context(args, context).await
     }
 }
 
@@ -763,6 +779,47 @@ pub fn shell_tool_for_runtime(
     runtime_shell_assembly(security, runtime, risk_profile, root_config).shell_tool
 }
 
+/// The TLS coherence witness for one plugin instance, over the inputs read from
+/// the same locked config view as its policy or its frame's values. The keyed
+/// derivation lives in `zeroclaw_plugins`; this only hands over those inputs.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_tls_config_witness(
+    config: &Config,
+    instance_key: &str,
+) -> Result<zeroclaw_plugins::egress::TlsConfigWitness, zeroclaw_plugins::error::PluginError> {
+    let mut entries = config
+        .plugins
+        .entries
+        .iter()
+        .filter(|entry| entry.name == instance_key);
+    let entry = entries.next();
+    if entries.next().is_some() {
+        return Err(zeroclaw_plugins::error::PluginError::InvalidConfig(
+            "plugin TLS coherence inputs are unavailable".to_string(),
+        ));
+    }
+    // Borrow sorted values: no plaintext serialization buffer is built.
+    let values = entry.map(|entry| {
+        entry
+            .config
+            .iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+    });
+    zeroclaw_plugins::egress::TlsConfigWitness::derive(&(
+        instance_key,
+        entry.map(|entry| {
+            (
+                &entry.egress_hosts,
+                &entry.egress_allow_private,
+                &entry.tls_profiles,
+            )
+        }),
+        values,
+        &config.security.nat64_prefixes,
+        config.plugins.limits.max_connections_per_instance,
+    ))
+}
+
 /// One plugin instance's egress policy, read from canonical config at use time.
 ///
 /// `instance_key` is the instance's
@@ -780,6 +837,7 @@ pub fn shell_tool_for_runtime(
 fn plugin_egress_policy(
     config: &Config,
     instance_key: &str,
+    may_read_config: bool,
 ) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
     use zeroclaw_plugins::egress::{
         EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
@@ -839,6 +897,16 @@ fn plugin_egress_policy(
         config.plugins.limits.max_connections_per_instance,
     )?
     .with_tls_profiles(profiles)
+    .and_then(|policy| {
+        // Permissionless transports must not inspect the material inputs merely
+        // to authorize a destination. Materialization will fail closed later.
+        if !may_read_config {
+            return Ok(policy);
+        }
+        let witness = plugin_tls_config_witness(config, instance_key)
+            .map_err(|error| EgressError::PolicyUnavailable(error.to_string()))?;
+        Ok(policy.with_tls_config_witness(witness))
+    })
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
@@ -864,16 +932,21 @@ fn plugin_egress_policy(
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_egress_service(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::egress::EgressHostService {
     zeroclaw_plugins::egress::EgressHostService::new(
         zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
             let instance_key = scope.id().config_entry_key().map_err(|error| {
                 zeroclaw_plugins::egress::EgressError::PolicyUnavailable(error.to_string())
             })?;
+            let may_read_config = scope
+                .grants()
+                .allows(zeroclaw_plugins::PluginPermission::ConfigRead);
             match live_config.as_ref() {
-                Some(handle) => plugin_egress_policy(&handle.read(), &instance_key),
-                None => plugin_egress_policy(&config, &instance_key),
+                Some(handle) => {
+                    plugin_egress_policy(&handle.read(), &instance_key, may_read_config)
+                }
+                None => plugin_egress_policy(&config, &instance_key, may_read_config),
             }
         }),
     )
@@ -928,7 +1001,7 @@ fn plugin_config_values(
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
     let data_dir = config.data_dir.clone();
     let config_dir = config
@@ -948,12 +1021,14 @@ pub(crate) fn plugin_host_services(
         // Filled from the same config view the values come from, so the
         // reserved set and the secrets it withholds share one revision.
         let mut host_only = Vec::new();
+        let mut witness = None;
         let resolved = if let Some(live_config) = &live_config {
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
                 // Transient per-call view: schema/grant checks happen before
                 // this access, and the global lock is released before guest
                 // setup.
                 let config = live_config.read();
+                witness = Some(plugin_tls_config_witness(&config, &config_entry_key)?);
                 host_only = plugin_tls_secret_properties(&config, &config_entry_key);
                 plugin_config_values(&config, &config_entry_key, package)
             })
@@ -964,11 +1039,20 @@ pub(crate) fn plugin_host_services(
                 )
             })?;
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                witness = Some(plugin_tls_config_witness(config, &config_entry_key)?);
                 host_only = plugin_tls_secret_properties(config, &config_entry_key);
                 plugin_config_values(config, &config_entry_key, package)
             })
         };
-        resolved.map(|resolved| resolved.reserve_for_host(host_only))
+        resolved.map(|resolved| {
+            let resolved = resolved.reserve_for_host(host_only);
+            // A schema permitted to withhold config does not invoke the source
+            // closure. Preserve that empty view; it cannot materialize TLS secrets.
+            match witness {
+                Some(witness) => resolved.with_tls_config_witness(witness),
+                None => resolved,
+            }
+        })
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
@@ -1041,7 +1125,7 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_and_acp_sessions(
         config,
@@ -1099,7 +1183,7 @@ pub(crate) fn all_tools_with_runtime_context(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
@@ -1148,13 +1232,13 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        Ok(match handle.join() {
+        match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
-        })
+        }
     })
 }
 
@@ -1188,7 +1272,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_context(
@@ -1246,7 +1330,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
 ) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime_context(
@@ -1303,10 +1387,10 @@ fn all_tools_with_runtime_on_thread(
     tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
@@ -1314,6 +1398,10 @@ fn all_tools_with_runtime_on_thread(
         shell_tool,
         sandbox,
     } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
+    sandbox.check_initialization().map_err(|error| {
+        let context = format!("agents.{agent_alias}: {error}");
+        anyhow::Error::new(error).context(context)
+    })?;
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -1652,9 +1740,9 @@ fn all_tools_with_runtime_on_thread(
     // The four a2a_* tools share one client holding the live config handle, so
     // peer/credential/security resolution happens at call time (no stored peer Vec).
     if root_config.a2a.client.enabled {
-        let live = live_config
-            .clone()
-            .unwrap_or_else(|| Arc::new(parking_lot::RwLock::new(root_config.clone())));
+        let live = live_config.clone().unwrap_or_else(|| {
+            zeroclaw_config::live::LiveConfig::new(root_config.clone()).handle()
+        });
         // The zeroclaw dir (config file parent) + secrets.encrypt enable
         // decrypting encrypted peer tokens via the canonical SecretStore,
         // the same path http_request uses for its auth_secret values.
@@ -2282,7 +2370,7 @@ fn all_tools_with_runtime_on_thread(
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
                 );
-                return AllToolsResult {
+                return Ok(AllToolsResult {
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
@@ -2293,7 +2381,7 @@ fn all_tools_with_runtime_on_thread(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
-                };
+                });
             }
 
             let resolved = zeroclaw_tools::microsoft365::types::Microsoft365ResolvedConfig {
@@ -2500,7 +2588,7 @@ fn all_tools_with_runtime_on_thread(
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
 
-    AllToolsResult {
+    Ok(AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
@@ -2511,15 +2599,35 @@ fn all_tools_with_runtime_on_thread(
         escalate_handle,
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
-    }
+    })
 }
 
+/// Why [`claim_plugin_tool_name`] refused a guest-declared tool name.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginToolNameRefusal {
+    /// A tool this registry build already registered holds the name.
+    Taken,
+    /// The name contains the MCP separator, so it can match an MCP tool's
+    /// `<server>__<tool>` name, which registers only after plugin tools.
+    McpNamespace,
+}
+
+/// Claim a guest-declared tool name for a plugin tool. A refused name
+/// reserves nothing.
 #[cfg(feature = "plugins-wasm")]
 fn claim_plugin_tool_name(
     registered_names: &mut std::collections::HashSet<String>,
     plugin_name: &str,
-) -> bool {
-    registered_names.insert(plugin_name.to_string())
+) -> Result<(), PluginToolNameRefusal> {
+    if plugin_name.contains(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR) {
+        return Err(PluginToolNameRefusal::McpNamespace);
+    }
+    if registered_names.insert(plugin_name.to_string()) {
+        Ok(())
+    } else {
+        Err(PluginToolNameRefusal::Taken)
+    }
 }
 
 /// Construct and register every tool-plugin instance the activation plan
@@ -2609,19 +2717,43 @@ fn register_plugin_tools(
         );
         match tool {
             Ok(tool) => {
-                if !claim_plugin_tool_name(registered_names, tool.name()) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                match claim_plugin_tool_name(registered_names, tool.name()) {
+                    Ok(()) => {}
+                    Err(PluginToolNameRefusal::Taken) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Load
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "plugin": manifest.name,
                                 "tool": tool.name(),
                                 "error_key": "plugin_tool_name_conflict",
                             })),
-                        "Plugin tool conflicts with an already registered tool"
-                    );
-                    continue;
+                            "Plugin tool conflicts with an already registered tool"
+                        );
+                        continue;
+                    }
+                    Err(PluginToolNameRefusal::McpNamespace) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Load
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": manifest.name,
+                                "tool": tool.name(),
+                                "error_key": "plugin_tool_name_reserved",
+                            })),
+                            "Plugin tool name contains the MCP separator `__`, which \
+                             only MCP tool names may use"
+                        );
+                        continue;
+                    }
                 }
                 tool_arcs.push(Arc::new(tool));
                 registered_count += 1;
@@ -2917,6 +3049,74 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registry_reports_seatbelt_initialization_before_tool_execution() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").is_file() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let cycle = tmp.path().join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        let cfg = test_config(&tmp);
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &MemoryConfig {
+                    backend: "none".into(),
+                    ..MemoryConfig::default()
+                },
+                tmp.path(),
+                None,
+            )
+            .unwrap(),
+        );
+        let build = |root, enabled| {
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: tmp.path().to_path_buf(),
+                allowed_roots_read_only: vec![root],
+                ..SecurityPolicy::default()
+            });
+            let risk = zeroclaw_config::schema::RiskProfileConfig {
+                sandbox_enabled: Some(enabled),
+                sandbox_backend: Some("sandbox-exec".into()),
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            };
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk,
+                "test-agent",
+                Arc::new(zeroclaw_config::platform::NativeRuntime::new()),
+                memory.clone(),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let error = build(cycle.clone(), true)
+            .err()
+            .expect("registry must reject failed Seatbelt initialization");
+        assert!(
+            error
+                .to_string()
+                .starts_with("agents.test-agent: Seatbelt initialization failed: Seatbelt root symlink limit exceeded")
+        );
+        assert!(build(tmp.path().to_path_buf(), true).is_ok());
+        assert!(build(cycle, false).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
@@ -3030,20 +3230,18 @@ const = true
             entry(&instance_key, "true"),
             entry(&backup_instance_key, "false"),
         ];
-        let live = Arc::new(parking_lot::RwLock::new(current));
-        let services = plugin_host_services(
-            Arc::clone(&host),
-            Arc::new(snapshot),
-            Some(Arc::clone(&live)),
-        );
+        let live = zeroclaw_config::live::LiveConfig::new(current);
+        let services =
+            plugin_host_services(Arc::clone(&host), Arc::new(snapshot), Some(live.handle()));
 
         assert!(services.resolve_config(&scope).is_ok());
         assert!(
             services.resolve_config(&backup_scope).is_err(),
             "backup must use its invalid canonical entry, not a valid raw-name decoy"
         );
+        let mut updated = live.snapshot();
         for (key, enabled) in [(&instance_key, "false"), (&backup_instance_key, "true")] {
-            live.write()
+            updated
                 .plugins
                 .entries
                 .iter_mut()
@@ -3052,6 +3250,8 @@ const = true
                 .config
                 .insert("enabled".to_string(), enabled.to_string());
         }
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert!(
             services.resolve_config(&scope).is_err(),
             "work must observe its own canonical key's live update"
@@ -3060,6 +3260,252 @@ const = true
             services.resolve_config(&backup_scope).is_ok(),
             "backup must resolve independently through the shared service"
         );
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn plugin_tls_coherence_preserves_frame_identity_and_live_grants() {
+        use zeroclaw_plugins::egress::{EgressError, EgressRequest, EgressTransport};
+        use zeroclaw_plugins::{PluginCapability, PluginPermission};
+        let tmp = TempDir::new().unwrap();
+        let package = tmp.path().join("tls-coherence");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            package.join("manifest.toml"),
+            r#"
+name = "tls-coherence"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read", "socket_client", "websocket_client"]
+[config_schema]
+type = "object"
+additionalProperties = false
+[config_schema.properties.ca]
+type = "string"
+x-secret = true
+[config_schema.properties.cert]
+type = "string"
+x-secret = true
+[config_schema.properties.key]
+type = "string"
+x-secret = true
+"#,
+        )
+        .unwrap();
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(tmp.path()).unwrap());
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            host.manifest("tls-coherence").unwrap(),
+            PluginCapability::Tool,
+            "coherence",
+            [
+                PluginPermission::ConfigRead,
+                PluginPermission::SocketClient,
+                PluginPermission::WebSocketClient,
+            ],
+        )
+        .unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params.self_signed(&ca_key).unwrap();
+        let client = |name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            (cert, key)
+        };
+        let (cert_a, key_a) = client("identity-a");
+        let (cert_b, key_b) = client("identity-b");
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert =
+            rcgen::CertificateParams::new(vec!["a.example".into(), "b.example".into()])
+                .unwrap()
+                .signed_by(&server_key, &ca, &ca_key)
+                .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![server_cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+                )
+                .unwrap(),
+        );
+        async fn peer_identity(
+            client: Arc<rustls::ClientConfig>,
+            server: Arc<rustls::ServerConfig>,
+            name: &'static str,
+        ) -> Vec<u8> {
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let future = async {
+                let (client, server) = tokio::join!(
+                    tokio_rustls::TlsConnector::from(client)
+                        .connect(rustls::pki_types::ServerName::try_from(name).unwrap(), a),
+                    tokio_rustls::TlsAcceptor::from(server).accept(b)
+                );
+                assert!(client.is_ok());
+                server.unwrap().get_ref().1.peer_certificates().unwrap()[0]
+                    .as_ref()
+                    .to_vec()
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), future)
+                .await
+                .unwrap()
+        }
+        let row = |destination: &str, cert: &rcgen::Certificate, key: &rcgen::KeyPair| {
+            zeroclaw_config::schema::PluginEntryConfig {
+                name: scope.id().config_entry_key().unwrap(),
+                config: HashMap::from([
+                    ("ca".into(), ca.pem()),
+                    ("cert".into(), cert.pem()),
+                    ("key".into(), key.serialize_pem()),
+                ]),
+                egress_hosts: vec![destination.into()],
+                tls_profiles: vec![zeroclaw_config::schema::PluginTlsProfileConfig {
+                    name: "identity".into(),
+                    hosts: vec![destination.into()],
+                    system_roots: false,
+                    custom_ca_secret: Some("ca".into()),
+                    client_certificate_secret: Some("cert".into()),
+                    client_private_key_secret: Some("key".into()),
+                }],
+                ..Default::default()
+            }
+        };
+        let mut initial = Config::default();
+        initial.plugins.entries = vec![row("a.example", &cert_a, &key_a)];
+        let live = zeroclaw_config::live::LiveConfig::new(initial.clone());
+        let withheld_scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            host.manifest("tls-coherence").unwrap(),
+            PluginCapability::Tool,
+            "withheld",
+            [PluginPermission::SocketClient],
+        )
+        .unwrap();
+        let services = plugin_host_services(host, Arc::new(initial.clone()), Some(live.handle()));
+        assert!(
+            services.resolve_config(&withheld_scope).is_ok(),
+            "withheld config remains an empty valid view without secret reads"
+        );
+        let egress = plugin_egress_service(Arc::new(initial.clone()), Some(live.handle()));
+        let authorize = |host: &str, transport| {
+            egress.authorize_addresses(
+                EgressRequest::new(scope.clone(), transport, host, 443)
+                    .unwrap()
+                    .with_tls_profile("identity")
+                    .unwrap(),
+                [std::net::SocketAddr::from(([1, 1, 1, 1], 443))],
+            )
+        };
+        let frame_a = services.resolve_config(&scope).unwrap();
+        let admission_a = authorize("a.example", EgressTransport::Tls).unwrap();
+        let connection_a = frame_a
+            .tls_client_config(&admission_a, &rustls::RootCertStore::empty())
+            .unwrap();
+        assert_eq!(
+            peer_identity(connection_a.clone(), server.clone(), "a.example").await,
+            cert_a.der().as_ref()
+        );
+        let mut updated = live.snapshot();
+        updated.plugins.entries = vec![row("b.example", &cert_b, &key_b)];
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
+        for transport in [
+            EgressTransport::Tls,
+            EgressTransport::StartTls,
+            EgressTransport::WebSocket { encrypted: true },
+        ] {
+            let admission_b = authorize("b.example", transport).unwrap();
+            let presented =
+                match frame_a.tls_client_config(&admission_b, &rustls::RootCertStore::empty()) {
+                    Ok(client) => Some(peer_identity(client, server.clone(), "b.example").await),
+                    Err(EgressError::TlsConfigMismatch) => None,
+                    Err(error) => panic!("unexpected materialization refusal: {error}"),
+                };
+            assert!(
+                presented.is_none(),
+                "destination B received an identity from the old frame: {presented:?}"
+            );
+        }
+        assert!(
+            authorize("a.example", EgressTransport::Tls).is_err(),
+            "grants remain live"
+        );
+        let frame_b = services.resolve_config(&scope).unwrap();
+        assert!(
+            matches!(
+                frame_b.ensure_tls_authorization(&admission_a),
+                Err(EgressError::TlsConfigMismatch)
+            ),
+            "old authorization cannot consume a newly resolved frame"
+        );
+        let admission_b = authorize("b.example", EgressTransport::Tls).unwrap();
+        let connection_b = frame_b
+            .tls_client_config(&admission_b, &rustls::RootCertStore::empty())
+            .unwrap();
+        assert_eq!(
+            peer_identity(connection_b, server.clone(), "b.example").await,
+            cert_b.der().as_ref()
+        );
+        assert_eq!(
+            peer_identity(connection_a, server, "a.example").await,
+            cert_a.der().as_ref(),
+            "already materialized connections keep their identity"
+        );
+        // Each material/reference field participates even if destination is unchanged.
+        let current = live.snapshot();
+        for property in ["ca", "cert", "key"] {
+            let mut updated = current.clone();
+            updated.plugins.entries[0]
+                .config
+                .insert(property.into(), "changed".into());
+            live.publish(live.next_revision().unwrap(), updated)
+                .unwrap();
+            let next = authorize("b.example", EgressTransport::Tls).unwrap();
+            assert!(matches!(
+                frame_b.ensure_tls_authorization(&next),
+                Err(EgressError::TlsConfigMismatch)
+            ));
+        }
+        for property in ["ca", "cert", "key"] {
+            let mut updated = current.clone();
+            let profile = &mut updated.plugins.entries[0].tls_profiles[0];
+            match property {
+                "ca" => profile.custom_ca_secret = Some("new_ca".into()),
+                "cert" => profile.client_certificate_secret = Some("new_cert".into()),
+                _ => profile.client_private_key_secret = Some("new_key".into()),
+            }
+            live.publish(live.next_revision().unwrap(), updated)
+                .unwrap();
+            let next = authorize("b.example", EgressTransport::Tls).unwrap();
+            assert!(matches!(
+                frame_b.ensure_tls_authorization(&next),
+                Err(EgressError::TlsConfigMismatch)
+            ));
+        }
+        let mut updated = current;
+        updated.plugins.entries[0].tls_profiles.clear();
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
+        assert!(matches!(
+            authorize("b.example", EgressTransport::Tls),
+            Err(EgressError::UnknownTlsProfile(_))
+        ));
     }
 
     /// End-to-end over the resolver the registry actually installs: an operator
@@ -3222,7 +3668,7 @@ permissions = ["http_client"]
             std::collections::HashSet::from(["shell".to_string(), PipelineTool::NAME.to_string()]);
         let accepted = ["shell", PipelineTool::NAME, "novel-tool", "novel-tool"]
             .into_iter()
-            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name).is_ok())
             .collect::<Vec<_>>();
 
         assert_eq!(accepted, vec!["novel-tool"]);
@@ -3233,6 +3679,41 @@ permissions = ["http_client"]
                 PipelineTool::NAME.to_string(),
                 "novel-tool".to_string(),
             ])
+        );
+    }
+
+    /// MCP tool names are not registered yet when plugin tools claim theirs,
+    /// so the separator itself is refused rather than any particular name.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_in_the_mcp_namespace_are_refused() {
+        let mut registered_names = std::collections::HashSet::new();
+
+        for name in [
+            "filesystem__read_file",
+            "__leading",
+            "trailing__",
+            "a__b__c",
+        ] {
+            assert_eq!(
+                claim_plugin_tool_name(&mut registered_names, name),
+                Err(PluginToolNameRefusal::McpNamespace),
+                "`{name}` contains the MCP separator"
+            );
+        }
+        assert!(
+            registered_names.is_empty(),
+            "a refused name must reserve nothing: {registered_names:?}"
+        );
+
+        // A single underscore is an ordinary name character.
+        assert_eq!(
+            claim_plugin_tool_name(&mut registered_names, "redact_text"),
+            Ok(())
+        );
+        assert_eq!(
+            claim_plugin_tool_name(&mut registered_names, "redact_text"),
+            Err(PluginToolNameRefusal::Taken)
         );
     }
 
@@ -3344,6 +3825,18 @@ permissions = ["http_client"]
         host: &Arc<zeroclaw_plugins::host::PluginHost>,
         reserved: &[&str],
     ) -> Vec<String> {
+        run_tool_plugin_loader(config, host, reserved).0
+    }
+
+    /// Run the production tool loader once and report, each in sorted order,
+    /// the packages whose guest construction it entered and the names of the
+    /// tools it registered.
+    #[cfg(feature = "plugins-wasm")]
+    fn run_tool_plugin_loader(
+        config: &Config,
+        host: &Arc<zeroclaw_plugins::host::PluginHost>,
+        reserved: &[&str],
+    ) -> (Vec<String>, Vec<String>) {
         let (resolver, probed) = recording_resolver(host);
         let state_dir = tempfile::tempdir().expect("plugin state dir");
         let services = zeroclaw_plugins::services::PluginHostServices::new(
@@ -3366,7 +3859,12 @@ permissions = ["http_client"]
         );
         let mut probed = probed.lock().unwrap().clone();
         probed.sort();
-        probed
+        let mut registered: Vec<String> = tool_arcs
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        registered.sort();
+        (probed, registered)
     }
 
     /// A plugin whose name already belongs to a native, reserved, or
@@ -3418,6 +3916,107 @@ permissions = ["http_client"]
         let probed = tool_packages_reaching_construction(&config, &host, &[]);
 
         assert_eq!(probed, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// Build the in-tree tool fixture with `features` and return its component
+    /// bytes. Each variant gets its own target directory, so building one
+    /// cannot overwrite another's artifact, and the nested Cargo invocation
+    /// does not contend with this test process's build lock.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn tool_fixture_component(variant: &str, features: &[&str]) -> Vec<u8> {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture_dir = manifest_dir.join("../zeroclaw-plugins/tests/fixtures/tool-fixture");
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(
+                || manifest_dir.join("../../target"),
+                std::path::PathBuf::from,
+            )
+            .join(format!("tool-plugin-fixture-{variant}"));
+        let mut cargo = std::process::Command::new(env!("CARGO"));
+        cargo
+            .current_dir(&fixture_dir)
+            .args([
+                "build",
+                "--locked",
+                "--quiet",
+                "--package",
+                "zeroclaw-tool-plugin-fixture",
+                "--target",
+                "wasm32-wasip2",
+                "--target-dir",
+            ])
+            .arg(&target_dir);
+        if !features.is_empty() {
+            cargo.arg("--features").arg(features.join(","));
+        }
+        let status = cargo
+            .status()
+            .expect("run Cargo for the tool component fixture");
+        assert!(
+            status.success(),
+            "tool fixture must build; install the wasm32-wasip2 target"
+        );
+        std::fs::read(target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm"))
+            .expect("tool fixture WASM was produced")
+    }
+
+    /// Lay out a loadable tool package the way `zeroclaw plugin install` does.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn install_tool_component(root: &std::path::Path, name: &str, component: &[u8]) {
+        let package_dir = root.join(name);
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("plugin.wasm"), component).unwrap();
+    }
+
+    /// MCP tools register as `<server>__<tool>` after plugin registration, so
+    /// no reserved name can stand in for them when plugins load. A guest that
+    /// declares such a name must still not be registered, or it would sit
+    /// ahead of the real MCP tool in first-match dispatch and receive its
+    /// calls.
+    ///
+    /// Both packages run the same real component, so the one with the
+    /// ordinary name is the control: it shows the guests load and register
+    /// through this path, and that only the MCP-shaped name is refused.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[test]
+    fn colliding_plugin_tool_in_the_mcp_namespace_is_not_registered() {
+        let plugins = TempDir::new().unwrap();
+        install_tool_component(
+            plugins.path(),
+            "echo-tool",
+            &tool_fixture_component("default", &[]),
+        );
+        install_tool_component(
+            plugins.path(),
+            "mcp-shaped-tool",
+            &tool_fixture_component("namespace-mcp-tool", &["namespace-mcp-tool"]),
+        );
+
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let config = plugin_activation_config(plugins.path());
+
+        // Nothing is reserved: the MCP server that would own the name has not
+        // registered when plugins load.
+        let (constructed, registered) = run_tool_plugin_loader(&config, &host, &[]);
+
+        assert_eq!(
+            constructed,
+            vec!["echo-tool".to_string(), "mcp-shaped-tool".to_string()],
+            "both guests must be constructed so their declared names are known"
+        );
+        assert_eq!(
+            registered,
+            vec!["config-echo".to_string()],
+            "a plugin tool named like an MCP tool must not be registered"
+        );
     }
 
     /// A mixed channel/tool/skill candidate set that exceeds the shared
@@ -5903,7 +6502,7 @@ permissions = ["http_client"]
             allowed_private_hosts: vec!["127.0.0.1".into()],
             ..FileDownloadConfig::default()
         };
-        let live_config = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+        let live_config = zeroclaw_config::live::LiveConfig::new(root_config.clone());
 
         let tools = all_tools_with_runtime(
             Arc::new(root_config.clone()),
@@ -5926,7 +6525,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
-            Some(live_config.clone()),
+            Some(live_config.handle()),
         )
         .expect("tool registry should build")
         .tools;
@@ -5939,11 +6538,11 @@ permissions = ["http_client"]
         let first = file_download.execute(args.clone()).await.unwrap();
         assert!(first.success, "allowlisted local endpoint should pass");
 
+        let mut revoked = live_config.snapshot();
+        revoked.file_download.allowed_private_hosts.clear();
         live_config
-            .write()
-            .file_download
-            .allowed_private_hosts
-            .clear();
+            .publish(live_config.next_revision().unwrap(), revoked)
+            .unwrap();
 
         let second = file_download.execute(args).await.unwrap();
         assert!(
@@ -5955,6 +6554,276 @@ permissions = ["http_client"]
                 .error
                 .unwrap_or_default()
                 .contains("file_download.allowed_private_hosts")
+        );
+    }
+
+    #[test]
+    fn every_reentrant_agent_tool_is_inventoried() {
+        let missing: Vec<&str> = REENTRANT_AGENT_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "REENTRANT_AGENT_TOOLS names tools missing from the built-in inventory: {missing:?}"
+        );
+    }
+
+    /// Names in the scoped registry assembled with every built-in tool family a
+    /// unit test can switch on. The data, config, and workspace directories, the
+    /// knowledge database, the security playbook and report directories, the
+    /// project report directory, and the plugin directory all point under `tmp`.
+    /// Nothing reaches the network: tool construction only records endpoints and
+    /// placeholder credentials, and the MCP registry is a test stub whose one
+    /// server is never contacted.
+    async fn maximal_registry_names(tmp: &TempDir) -> std::collections::BTreeSet<String> {
+        use zeroclaw_config::schema::{
+            DiscordConfig, McpBundleConfig, McpServerConfig, McpTransport, Microsoft365Config,
+            OpenAIModelProviderConfig, SkillsPromptInjectionMode,
+        };
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(tmp);
+        std::fs::create_dir_all(&cfg.data_dir).unwrap();
+        // Plugin tools are outside the inventory, so plugins stay off, and the
+        // plugin directory points under `tmp` as well.
+        cfg.plugins.enabled = false;
+        cfg.plugins.plugins_dir = tmp.path().join("plugins").display().to_string();
+        cfg.pipeline.enabled = true;
+        cfg.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
+        cfg.sop.procedural_memory_enabled = true;
+        cfg.browser_delegate.enabled = true;
+        cfg.text_browser.enabled = true;
+        cfg.web_search.enabled = true;
+        cfg.notion.enabled = true;
+        cfg.notion.api_key = "inventory-placeholder".into();
+        cfg.jira.enabled = true;
+        cfg.jira.base_url = "https://jira.example.invalid".into();
+        cfg.jira.api_token = "inventory-placeholder".into();
+        cfg.project_intel.enabled = true;
+        cfg.project_intel.report_output_dir =
+            tmp.path().join("project-reports").display().to_string();
+        cfg.security_ops.enabled = true;
+        cfg.security_ops.playbooks_dir = tmp.path().join("playbooks").display().to_string();
+        cfg.security_ops.report_output_dir =
+            tmp.path().join("security-reports").display().to_string();
+        cfg.backup.enabled = true;
+        cfg.data_retention.enabled = true;
+        cfg.cloud_ops.enabled = true;
+        cfg.google_workspace.enabled = true;
+        cfg.claude_code.enabled = true;
+        cfg.codex_cli.enabled = true;
+        cfg.gemini_cli.enabled = true;
+        cfg.opencode_cli.enabled = true;
+        cfg.claude_code_runner.enabled = true;
+        cfg.linkedin.enabled = true;
+        cfg.image_gen.enabled = true;
+        cfg.file_upload.url = Some("https://upload.example.invalid/files".into());
+        cfg.file_upload_bundle.url = Some("https://upload.example.invalid/bundles".into());
+        cfg.file_download.url = Some("https://download.example.invalid/files".into());
+        cfg.a2a.client.enabled = true;
+        cfg.microsoft365 = Microsoft365Config {
+            enabled: true,
+            tenant_id: Some("inventory-tenant".into()),
+            client_id: Some("inventory-client".into()),
+            // The device-code flow registers without a client secret.
+            auth_flow: "device_code".into(),
+            token_cache_encrypted: false,
+            ..Microsoft365Config::default()
+        };
+        cfg.knowledge.enabled = true;
+        cfg.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+        cfg.channels.email.insert(
+            "inventory".into(),
+            zeroclaw_config::scattered_types::EmailConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        cfg.channels.discord.insert(
+            "inventory".into(),
+            DiscordConfig {
+                archive: true,
+                ..Default::default()
+            },
+        );
+        // `llm_task` needs a provider for the calling agent, and the agent's MCP
+        // bundle grants the server that the stub registry below stands in for.
+        cfg.providers
+            .models
+            .openai
+            .insert("inventory".into(), OpenAIModelProviderConfig::default());
+        cfg.mcp.enabled = true;
+        cfg.mcp.deferred_loading = true;
+        cfg.mcp.servers = vec![McpServerConfig {
+            name: "inventory".into(),
+            transport: McpTransport::Stdio,
+            command: "inventory-mcp-server-never-started".into(),
+            ..Default::default()
+        }];
+        cfg.mcp_bundles.insert(
+            "inventory".into(),
+            McpBundleConfig {
+                servers: vec!["inventory".into()],
+                exclude: Vec::new(),
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.inventory".into(),
+                mcp_bundles: vec!["inventory".into()],
+                ..Default::default()
+            },
+        );
+        let delegate_targets = HashMap::from([(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.inventory".into(),
+                ..Default::default()
+            },
+        )]);
+        let browser = BrowserConfig {
+            enabled: true,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let web_fetch = zeroclaw_config::schema::WebFetchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let sop_engine = Arc::new(Mutex::new(SopEngine::new(cfg.sop.clone())));
+        let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
+
+        let built = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            Some("inventory-placeholder"),
+            None,
+            &browser,
+            &http,
+            &web_fetch,
+            &workspace,
+            &delegate_targets,
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(sop_engine),
+            Some(sop_audit),
+            None,
+        )
+        .expect("tool registry builds");
+
+        // The scoped assembly mints `execute_pipeline` and the MCP capability
+        // tools. `acp_delivery` keeps `deliver_file`, which only ACP turns admit.
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &cfg,
+            agent_alias: "test-agent",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: true,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: true,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: Some(Arc::new(McpRegistry::for_test_with_server_count(1))),
+        })
+        .await;
+        assembled
+            .registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_registered_builtin_is_inventoried() {
+        let tmp = TempDir::new().unwrap();
+        let registered = maximal_registry_names(&tmp).await;
+        assert!(
+            registered.contains("shell"),
+            "positive control: the maximal registry must be populated; got {registered:?}"
+        );
+
+        let uninventoried: Vec<&String> = registered
+            .iter()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            uninventoried.is_empty(),
+            "the registry registers tools missing from BUILTIN_TOOLS in \
+             crates/zeroclaw-tools/src/inventory.rs; add each one there and to the \
+             tier tables in docs/book/src/developing/tool-inventory.md: {uninventoried:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_inventoried_tool_registers_under_a_maximal_config() {
+        // Rows a unit test cannot construct, with the reason.
+        let unconstructible = std::collections::BTreeMap::from([(
+            "tool_search",
+            "assembly mints it only behind two gates: `mcp.deferred_loading`, which \
+             defaults to false and is on here, and an MCP registry that advertises at \
+             least one tool, which only a connected MCP server does",
+        )]);
+        for name in unconstructible.keys() {
+            assert!(
+                zeroclaw_tools::inventory::is_builtin_tool_name(name),
+                "`{name}` is allowlisted as unconstructible but is not inventoried"
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let registered = maximal_registry_names(&tmp).await;
+        let missing: Vec<&str> = zeroclaw_tools::inventory::BUILTIN_TOOLS
+            .iter()
+            .map(|spec| spec.name)
+            .filter(|name| !unconstructible.contains_key(name) && !registered.contains(*name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "inventoried tools that did not register under the maximal config; switch each \
+             one's gate on in maximal_registry_names or allowlist it with a reason: {missing:?}"
+        );
+
+        let now_constructible: Vec<&str> = unconstructible
+            .keys()
+            .copied()
+            .filter(|name| registered.contains(*name))
+            .collect();
+        assert!(
+            now_constructible.is_empty(),
+            "allowlisted tools now register under the maximal config; drop them from the \
+             allowlist: {now_constructible:?}"
         );
     }
 }

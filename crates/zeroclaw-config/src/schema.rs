@@ -958,6 +958,7 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
     /// Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination.
@@ -4628,6 +4629,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_single_tool_rounds(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|profile| profile.single_tool_rounds)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_max_execution_tree_iterations(&self, agent_alias: &str) -> Option<usize> {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_execution_tree_iterations)
@@ -5813,12 +5821,14 @@ pub struct McpServerConfig {
     /// Optional environment variables for stdio transport.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub env: HashMap<String, String>,
     /// Optional HTTP headers for HTTP/SSE transports. Treated as secret:
     /// the values commonly carry Bearer tokens for the upstream MCP server.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
     /// Optional per-call timeout in seconds (hard capped in validation).
@@ -7197,14 +7207,17 @@ pub struct MultimodalConfig {
     ///
     /// Caps the total number of `[IMAGE:...]` markers that survive into the
     /// provider request after multimodal preprocessing. Older images are
-    /// dropped first when the cumulative count exceeds this limit. When a
-    /// new image takes the count past the limit, the oldest surviving
-    /// image is removed from its message, which can invalidate a
-    /// provider's cached prefix from that message onward; a larger limit
-    /// delays cap eviction and reduces how many happen over a session,
-    /// but once the limit is full each further image still evicts one.
-    /// Acts as the upper bound on per-turn upload cost when tool outputs
-    /// surface local image paths.
+    /// dropped first. When a new image takes the count past the limit, the
+    /// oldest images are removed in one batch, down to half the limit
+    /// rounded up (4 -> 2, 8 -> 4, 16 -> 8); the count then grows back to the
+    /// limit before the next batch. Removing an image changes the message
+    /// that held it, which can invalidate a provider's cached prefix from
+    /// that message onward; batching means a session past the limit pays
+    /// that once every `max_images / 2 + 1` new images rather than on every
+    /// one. Right after a batch the model sees fewer older images than the
+    /// limit allows. A larger limit delays the first batch and makes each
+    /// one less frequent. Acts as the upper bound on per-turn upload cost
+    /// when tool outputs surface local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -8184,6 +8197,10 @@ pub struct WssConfig {
     /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
     /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
     /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// When the listeners are reached over Tailscale (`tunnel_provider =
+    /// "tailscale"`, or a `[wss]`/`[enroll]` bind on a tailnet address), the
+    /// node's MagicDNS name, short name, and tailnet IPs are added automatically
+    /// at startup; list them here only to pin names tailscaled does not report.
     /// Ignored when you bring your own server certificate via `cert_path`.
     #[serde(default)]
     pub sans: Vec<String>,
@@ -8241,6 +8258,25 @@ impl Default for WssConfig {
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
         }
+    }
+}
+
+impl WssClientAuthConfig {
+    /// The operator-provided (bring-your-own) CA that verifies client
+    /// certificates, when one is in effect: client auth enabled with a CA path.
+    /// In that mode the daemon holds no CA signing key, so it verifies clients
+    /// but cannot issue certificates and does not run the enrollment endpoint.
+    pub fn external_ca_path(&self) -> Option<&str> {
+        (self.enabled && !self.ca_cert_path.is_empty()).then_some(self.ca_cert_path.as_str())
+    }
+}
+
+impl WssConfig {
+    /// See [`WssClientAuthConfig::external_ca_path`].
+    pub fn external_client_ca(&self) -> Option<&str> {
+        self.client_auth
+            .as_ref()
+            .and_then(WssClientAuthConfig::external_ca_path)
     }
 }
 
@@ -9615,6 +9651,7 @@ pub struct PluginEntryConfig {
     pub name: String,
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub config: HashMap<String, String>,
     /// Destinations this plugin instance may reach. Default: empty,
@@ -10243,6 +10280,7 @@ pub struct FileUploadConfig {
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -10328,6 +10366,7 @@ pub struct FileUploadBundleConfig {
     /// Static HTTP headers attached to every upload request.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -10420,6 +10459,7 @@ pub struct FileDownloadConfig {
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -13438,6 +13478,7 @@ pub struct ObservabilityConfig {
     /// ```
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
 
@@ -14701,10 +14742,17 @@ pub struct RuntimeProfileConfig {
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
     pub parallel_tools: Option<bool>,
+    /// Request one native tool call per provider response when supported. Default off.
+    pub single_tool_rounds: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
     pub tool_call_dedup_exempt: Vec<String>,
+    /// Expose only basic workspace and memory tool schemas eagerly, with other
+    /// admitted built-ins discoverable through `tool_search`. Default false
+    /// preserves eager exposure. This never changes tool permissions; if
+    /// `tool_search` is not admitted, built-in schemas remain eager.
+    pub deferred_builtin_tools: bool,
     /// Maximum characters for the assembled system prompt. `None` inherits.
     pub max_system_prompt_chars: Option<usize>,
     /// Maximum characters for a single tool result. `None` inherits.
@@ -14755,8 +14803,10 @@ impl Default for RuntimeProfileConfig {
             context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
+            single_tool_rounds: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
+            deferred_builtin_tools: false,
             max_system_prompt_chars: None,
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
@@ -17133,6 +17183,18 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub use_markdown_blocks: bool,
+    /// Accept messages posted by other Slack apps and bots
+    /// (`subtype = "bot_message"`), such as Workflow Builder steps.
+    ///
+    /// Off by default: these senders are not humans, so accepting them widens
+    /// who can drive the agent. Enabling this does **not** bypass
+    /// authorization: the posting app's bot ID still has to match the
+    /// channel's peer allowlist, so allow specific bot IDs rather than `"*"`
+    /// unless every app in the workspace is trusted. This agent's own posts
+    /// are always ignored regardless of this setting.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allow_bot_messages: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -21407,31 +21469,120 @@ fn paths_equal_lexically(a: &Path, b: &Path) -> bool {
 /// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
 ///
 /// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
-/// before the data-dir rename, `<install_root>/workspace/plugins`). A directory
-/// is reported only when it differs from the configured plugins dir and contains
-/// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
-/// migration hint and to drive `zeroclaw plugin migrate`.
+/// before the data-dir rename, `<install_root>/workspace/plugins`). New V2
+/// splits route packages to host data. An older split's live agent workspace
+/// is not an automatic recovery source: compatible packages there require
+/// explicit operator adoption through `zeroclaw plugin install <path>`.
+/// Supported legacy root aliases are followed, but roots overlapping a known
+/// agent workspace in either direction are excluded. Target aliases are
+/// excluded and duplicate roots occur once. This selection does not bind the
+/// packages a later mover rescans or authenticate their historical origin.
+/// Used to surface a migration hint and to drive `zeroclaw plugin migrate`.
 #[must_use]
 pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
     let target = config.plugins.resolved_plugins_dir();
+    let canonical_target = std::fs::canonicalize(&target).ok();
+    let workspaces: Vec<PathBuf> = std::iter::once(config.agent_workspace_dir("default"))
+        .chain(
+            config
+                .agents
+                .keys()
+                .map(|alias| config.agent_workspace_dir(alias)),
+        )
+        .chain(std::iter::once(
+            config.install_root_dir().join("agents/default/workspace"),
+        ))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
     [
         config.data_dir.join("plugins"),
         config.install_root_dir().join("workspace").join("plugins"),
+        v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins"),
     ]
     .into_iter()
-    .filter(|legacy| *legacy != target && dir_has_plugin(legacy))
+    .filter(|legacy| {
+        if paths_equal_lexically(legacy, &target) || !dir_has_plugin(legacy) {
+            return false;
+        }
+        let Ok(canonical) = std::fs::canonicalize(legacy) else {
+            return false;
+        };
+        if workspaces
+            .iter()
+            .any(|workspace| legacy_root_overlaps_workspace(legacy, &canonical, workspace))
+        {
+            return false;
+        }
+        canonical_target.as_ref() != Some(&canonical) && seen.insert(canonical)
+    })
     .collect()
 }
 
-/// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
-/// `manifest.toml`).
+fn legacy_root_overlaps_workspace(legacy: &Path, canonical: &Path, workspace: &Path) -> bool {
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    if let Ok(workspace) = std::fs::canonicalize(workspace) {
+        return overlaps(canonical, &workspace);
+    }
+    // An absent declared workspace is still a known role. Compare normalized
+    // lexical paths conservatively; do not create it or attest it as present.
+    let Some(lexical_workspace) = legacy_lexical_absolute_path(workspace) else {
+        return true;
+    };
+    let Some(legacy) = legacy_lexical_absolute_path(legacy) else {
+        return true;
+    };
+    if overlaps(&legacy, &lexical_workspace) || overlaps(canonical, &lexical_workspace) {
+        return true;
+    }
+    // A declared absent child may be reached through an existing parent alias.
+    // Resolve only that existing ancestor, then compare the remaining declared
+    // path lexically. This does not attest the missing workspace as present.
+    for ancestor in workspace.ancestors().skip(1) {
+        if let Ok(parent) = std::fs::canonicalize(ancestor) {
+            let Ok(suffix) = workspace.strip_prefix(ancestor) else {
+                return true;
+            };
+            let Some(projected) = legacy_lexical_absolute_path(&parent.join(suffix)) else {
+                return true;
+            };
+            return overlaps(canonical, &projected);
+        }
+    }
+    false
+}
+
+fn legacy_lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    if !absolute.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+/// Returns `true` if `dir` holds at least one ordinary child directory containing
+/// a `manifest.toml`, matching the runtime's package-directory eligibility.
 fn dir_has_plugin(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    entries
-        .flatten()
-        .any(|entry| entry.path().join("manifest.toml").exists())
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry.path().join("manifest.toml").exists()
+    })
 }
 
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
@@ -23004,6 +23155,66 @@ impl Config {
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
+    }
+
+    /// Hydrate one already-migrated config body exactly as a reload would,
+    /// without replacing the config file.
+    ///
+    /// This is the preparation step for config migration (see the
+    /// gateway's migrate endpoint): the candidate must be fully hydrated
+    /// — strict parse into the current schema, computed paths attached,
+    /// secrets decrypted through the install's store, env overrides
+    /// applied with their save-masking snapshots captured — and must pass
+    /// strict validation *before* the migrated file is allowed to replace
+    /// the live one. Any failure (parse, secret, unresolvable env path,
+    /// validation) refuses the migration with the original config file
+    /// untouched and nothing published. Migration acceptance is stricter
+    /// than resilient boot ([`Config::load_or_init`] warns and serves);
+    /// an operator-driven replacement may not install a config the
+    /// current schema rejects.
+    ///
+    /// The caller supplies the canonical `config_path` and `data_dir`
+    /// (from the currently published config) so the prepared candidate is
+    /// exactly the config the next daemon generation would load from the
+    /// migrated file.
+    pub async fn prepare_from_migrated_toml(
+        content: &str,
+        config_path: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let mut config = crate::migration::migrate_to_current(content)
+            .context("migrated config failed to hydrate as the current schema")?;
+        config.config_path = config_path.to_path_buf();
+        config.data_dir = data_dir.to_path_buf();
+
+        if let Some(default_profile) = config.risk_profiles.get_mut("default") {
+            default_profile.ensure_default_auto_approve();
+        }
+
+        let zeroclaw_dir = config_path
+            .parent()
+            .context("config path must have a parent directory")?;
+        let store = crate::secrets::SecretStore::new(zeroclaw_dir, config.secrets.encrypt);
+        config.onepassword_reference_snapshots = collect_onepassword_reference_snapshots(&config);
+        config = tokio::task::spawn_blocking(move || {
+            config.decrypt_secrets(&store)?;
+            Ok::<_, anyhow::Error>(config)
+        })
+        .await
+        .context("migrated config secret decryption task failed")??;
+
+        let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
+        config.env_overridden_paths = applied.paths;
+        config.pre_override_snapshots = applied.snapshots;
+
+        // Strict validation: unlike resilient boot, an operator-driven
+        // migration refuses a candidate the current schema rejects. The
+        // refusal happens before any disk replacement, so the original
+        // file and the published pair are unchanged.
+        config
+            .validate()
+            .context("migrated config failed strict validation")?;
+        Ok(config)
     }
 
     /// Report that opting into `[verifiable_intent]` does not currently enable
@@ -30173,6 +30384,39 @@ zeroclaw-operators = "operator"
     }
 
     #[test]
+    async fn legacy_plugin_dirs_detects_data_destination_after_workspace_override() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        assert_eq!(migrated, config.install_root_dir().join("data/plugins"));
+        assert_ne!(migrated, config.data_dir.join("plugins"));
+        write_plugin(&migrated, "resumed");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        assert_ne!(
+            config.agent_workspace_dir("default").join("plugins"),
+            migrated
+        );
+
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![migrated]);
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_resumed_destination_when_it_is_the_target() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        config.plugins.plugins_dir = migrated.to_string_lossy().into_owned();
+        write_plugin(&migrated, "current");
+
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
     async fn legacy_plugin_dirs_empty_when_no_legacy_plugins() {
         let tmp = TempDir::new().unwrap();
         let config = config_with_dirs(tmp.path());
@@ -30193,6 +30437,78 @@ zeroclaw-operators = "operator"
 
         // The data-dir candidate now equals the target → not a "legacy" dir.
         assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_excludes_historical_and_live_agent_workspaces() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let historical = config.agent_workspace_dir("default").join("plugins");
+        write_plugin(&historical, "historical");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        write_plugin(
+            &config.agent_workspace_dir("default").join("plugins"),
+            "live",
+        );
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_canonical_target_and_duplicate_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let data = config.data_dir.join("plugins");
+        write_plugin(&data, "current");
+        config.plugins.plugins_dir = data
+            .join("..")
+            .join("plugins")
+            .to_string_lossy()
+            .into_owned();
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+
+        config.plugins.plugins_dir = tmp.path().join("managed").to_string_lossy().into_owned();
+        config.data_dir = config.install_root_dir().join("workspace");
+        let legacy = config.data_dir.join("plugins");
+        write_plugin(&legacy, "legacy");
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![legacy]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn legacy_plugin_dirs_follows_supported_alias_candidates() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        let outside = tmp.path().join("outside");
+        write_plugin(&outside, "unselected");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let data_alias = config.data_dir.join("plugins");
+        symlink(&outside, &data_alias).unwrap();
+        let legacy = config.install_root_dir().join("workspace/plugins");
+        std::fs::create_dir_all(&legacy).unwrap();
+        symlink(outside.join("unselected"), legacy.join("linked-package")).unwrap();
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias.clone()]
+        );
+        // An ordinary package directory can still use a manifest alias under
+        // the existing runtime manifest-loading contract.
+        std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
+        symlink(
+            outside.join("unselected/manifest.toml"),
+            legacy.join("linked-manifest/manifest.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias, legacy]
+        );
     }
 
     // ── Defaults ─────────────────────────────────────────────
@@ -30785,6 +31101,20 @@ open_skills_enabled = false
             config.effective_skills_prompt_mode("pinned_full"),
             SkillsPromptInjectionMode::Full
         );
+    }
+
+    #[test]
+    async fn runtime_profile_deferred_builtin_tools_is_opt_in() {
+        assert!(!RuntimeProfileConfig::default().deferred_builtin_tools);
+        let omitted: RuntimeProfileConfig = toml::from_str("").unwrap();
+        assert!(!omitted.deferred_builtin_tools);
+
+        let enabled: RuntimeProfileConfig =
+            toml::from_str("deferred_builtin_tools = true").unwrap();
+        assert!(enabled.deferred_builtin_tools);
+        let round_trip: RuntimeProfileConfig =
+            toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+        assert!(round_trip.deferred_builtin_tools);
     }
 
     #[test]
@@ -33683,6 +34013,40 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_single_tool_rounds_defaults_off_and_resolves_by_agent() {
+        let mut parsed = parse_test_config(
+            r#"
+[runtime_profiles.interactive]
+single_tool_rounds = true
+[runtime_profiles.batch]
+single_tool_rounds = false
+[runtime_profiles.unset]
+[agents.enabled]
+runtime_profile = "interactive"
+[agents.disabled]
+runtime_profile = "batch"
+[agents.unset]
+runtime_profile = "unset"
+[agents.missing]
+runtime_profile = "missing"
+"#,
+        );
+        assert_eq!(RuntimeProfileConfig::default().single_tool_rounds, None);
+        assert!(parsed.effective_single_tool_rounds("enabled"));
+        for alias in ["disabled", "unset", "missing", "unknown"] {
+            assert!(!parsed.effective_single_tool_rounds(alias));
+        }
+        parsed
+            .runtime_profiles
+            .get_mut("interactive")
+            .unwrap()
+            .single_tool_rounds = Some(false);
+        assert!(!parsed.effective_single_tool_rounds("enabled"));
+        let serialized = toml::to_string(&parsed.runtime_profiles["batch"]).unwrap();
+        assert!(serialized.contains("single_tool_rounds = false"));
     }
 
     #[test]
@@ -43272,7 +43636,173 @@ stream_tool_arguments = [
             "mcp.servers.acme.headers.Authorization"
         ));
         assert!(!Config::prop_is_secret("file_download.timeout_secs"));
-        assert!(!Config::prop_is_secret("file_download.headers"));
+        // The bare map path is the `PropKind::SecretMap` container row: it is
+        // secret-classified (it fronts encrypted values) even though its
+        // display carries only key names.
+        assert!(Config::prop_is_secret("file_download.headers"));
+    }
+
+    fn mcp_server_fixture(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: an empty `#[secret] HashMap<String, String>` (MCP `env`)
+    /// used to emit no property rows at all, so neither Zerocode nor the
+    /// dashboard could add the first key. The container row must exist on
+    /// an empty map and advertise itself as `SecretMap`.
+    #[test]
+    async fn empty_secret_map_emits_container_row() {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server_fixture("acme"));
+
+        let fields = config.prop_fields();
+        for leaf in ["env", "headers"] {
+            let path = format!("mcp.servers.acme.{leaf}");
+            let row = fields
+                .iter()
+                .find(|f| f.name == path)
+                .unwrap_or_else(|| panic!("missing container row `{path}`"));
+            assert_eq!(row.kind, crate::traits::PropKind::SecretMap);
+            assert!(row.is_secret);
+            assert_eq!(row.display_value, crate::traits::UNSET_DISPLAY);
+            assert_eq!(
+                row.credential_class,
+                Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+            );
+            assert_eq!(
+                config.get_prop(&path).unwrap(),
+                crate::traits::UNSET_DISPLAY
+            );
+            assert!(Config::prop_is_secret(&path));
+        }
+        assert!(
+            !fields
+                .iter()
+                .any(|f| f.name.starts_with("mcp.servers.acme.env.")),
+            "an empty map has no entry rows"
+        );
+    }
+
+    #[test]
+    async fn secret_map_entries_add_list_and_remove_without_leaking_values() {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server_fixture("acme"));
+
+        config
+            .set_prop("mcp.servers.acme.env.ZED_TOKEN", "zed-plaintext")
+            .unwrap();
+        config
+            .set_prop("mcp.servers.acme.env.API_KEY", "api-plaintext")
+            .unwrap();
+        assert_eq!(
+            config.mcp.servers[0].env.get("API_KEY").map(String::as_str),
+            Some("api-plaintext")
+        );
+
+        let fields = config.prop_fields();
+        let env_rows: Vec<&str> = fields
+            .iter()
+            .filter(|f| f.name.starts_with("mcp.servers.acme.env"))
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            env_rows,
+            vec![
+                "mcp.servers.acme.env",
+                "mcp.servers.acme.env.API_KEY",
+                "mcp.servers.acme.env.ZED_TOKEN",
+            ],
+            "container first, then entries in sorted key order"
+        );
+        // Container display lists key names only.
+        assert_eq!(
+            config.get_prop("mcp.servers.acme.env").unwrap(),
+            "API_KEY, ZED_TOKEN"
+        );
+        for field in &fields {
+            assert!(
+                !field.display_value.contains("plaintext"),
+                "`{}` leaked a secret value: {}",
+                field.name,
+                field.display_value
+            );
+        }
+
+        // Writing the container itself is rejected with guidance.
+        let err = config
+            .set_prop("mcp.servers.acme.env", "{\"X\":\"y\"}")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`env` is a key/value map") && err.contains("<this path>.<KEY>"),
+            "{err}"
+        );
+
+        // An empty value (what `config delete` sends) removes the entry.
+        config
+            .set_prop("mcp.servers.acme.env.ZED_TOKEN", "")
+            .unwrap();
+        assert!(!config.mcp.servers[0].env.contains_key("ZED_TOKEN"));
+        assert_eq!(config.get_prop("mcp.servers.acme.env").unwrap(), "API_KEY");
+        config.set_prop("mcp.servers.acme.env.API_KEY", "").unwrap();
+        assert!(config.mcp.servers[0].env.is_empty());
+        assert_eq!(
+            config.get_prop("mcp.servers.acme.env").unwrap(),
+            crate::traits::UNSET_DISPLAY
+        );
+    }
+
+    /// Same call sites the dashboard / Zerocode use (`set_prop_persistent`
+    /// then `save_dirty`): an added env entry lands on disk encrypted, and
+    /// removing it drops the key from disk rather than leaving `KEY = ""`.
+    #[test]
+    async fn save_dirty_persists_secret_map_entry_add_and_remove() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(mcp_server_fixture("fs"));
+
+        config
+            .set_prop_persistent("mcp.servers.fs.env.GBR_MAILBOX_KEY", "mailbox-plaintext")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("GBR_MAILBOX_KEY"),
+            "added env key must be written; got:\n{written}"
+        );
+        assert!(
+            !written.contains("mailbox-plaintext"),
+            "env values must be encrypted at rest; got:\n{written}"
+        );
+
+        config
+            .set_prop_persistent("mcp.servers.fs.env.GBR_MAILBOX_KEY", "")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("GBR_MAILBOX_KEY"),
+            "removed env key must be dropped from disk; got:\n{written}"
+        );
+        assert!(written.contains("name = \"fs\""), "{written}");
     }
 
     #[test]
@@ -49680,7 +50210,8 @@ model_provider = \"ollama.default\"
             PropKind::AliasRef
             | PropKind::StringArray
             | PropKind::ObjectArray
-            | PropKind::Object => None,
+            | PropKind::Object
+            | PropKind::SecretMap => None,
         }
     }
 

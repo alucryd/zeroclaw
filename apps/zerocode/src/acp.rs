@@ -166,6 +166,10 @@ impl Acp {
         self.inner.claims_pane_navigation(key)
     }
 
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.inner.claims_session_shortcut(key)
+    }
+
     pub(crate) fn clear_input(&mut self) {
         self.inner.clear_input();
     }
@@ -202,7 +206,7 @@ impl Acp {
         self.inner.handle_paste(text);
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
     }
 

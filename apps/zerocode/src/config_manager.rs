@@ -111,6 +111,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
 
 // ── Screen stack ─────────────────────────────────────────────────
 
+#[derive(Clone)]
 enum Screen {
     SectionList,
     TypeList {
@@ -148,6 +149,28 @@ enum FilterAction {
     Passthrough,
     /// Enter pressed — caller should act on the currently-selected filtered item.
     Accept,
+    /// Cancel restores the saved section instead of selecting an unfiltered row.
+    Cancel,
+}
+
+struct FilterOrigin {
+    pane: ZeroclawPane,
+    section_cursor: usize,
+    active_tab: usize,
+    /// Detail page open when a sidebar search started. Previewing other
+    /// sections replaces it, so cancel reopens this page rather than the
+    /// section root.
+    detail: Option<DetailOrigin>,
+}
+
+struct DetailOrigin {
+    screen: Screen,
+    loaded_section: Option<usize>,
+    type_cursor: usize,
+    alias_cursor: usize,
+    alias_tab: usize,
+    cost_cursor: usize,
+    field_cursor: usize,
 }
 
 enum FilterEditAction {
@@ -163,7 +186,7 @@ enum FilterEditAction {
 /// Which pane of the zeroclaw split holds keyboard focus. The section list
 /// (left) eagerly loads the highlighted section into the right pane for a live
 /// preview; focus moves to the detail (right) on the inward chord.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZeroclawPane {
     Sections,
     Detail,
@@ -171,7 +194,7 @@ enum ZeroclawPane {
 
 /// Top-level Config sub-tab: the daemon RPC editor (`zeroclaw`) first,
 /// the local client config (`zerocode`) second.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigSection {
     Zeroclaw,
     Zerocode,
@@ -233,6 +256,23 @@ fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static 
             .err()
             .map(|_| "zc-config-status-invalid-float"),
         _ => None,
+    }
+}
+
+/// Validate a new secret-map entry key (env var name, header name, …).
+/// Returns the Fluent key of the rejection message, or `None` when valid.
+/// Kept deliberately loose: the same row type fronts env vars, HTTP headers,
+/// and plugin settings, so only what can never be a valid key is refused.
+fn secret_map_key_validation_key(key: &str) -> Option<&'static str> {
+    if key.is_empty() {
+        Some("zc-config-secret-map-key-empty")
+    } else if key
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '=')
+    {
+        Some("zc-config-secret-map-key-invalid")
+    } else {
+        None
     }
 }
 
@@ -430,6 +470,9 @@ pub(crate) struct App {
     // Edit state
     edit_buf: String,
     edit_cursor: usize,
+    /// Two-step add on a `PropKind::SecretMap` row: `None` while the user
+    /// types the entry key, `Some(key)` while they type its (masked) value.
+    secret_map_entry_key: Option<String>,
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
@@ -437,6 +480,7 @@ pub(crate) struct App {
     // Filter state: None = inactive, Some(buf) = active filter
     filter: Option<String>,
     filter_cursor: usize,
+    filter_origin: Option<FilterOrigin>,
     // Tab state for field list
     active_tab: usize,
     tab_names: Vec<ConfigTab>,
@@ -503,11 +547,13 @@ impl App {
             field_cursor: 0,
             edit_buf: String::new(),
             edit_cursor: 0,
+            secret_map_entry_key: None,
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
             filter: None,
             filter_cursor: 0,
+            filter_origin: None,
             active_tab: 0,
             tab_names: Vec::new(),
             personality_files: Vec::new(),
@@ -594,6 +640,20 @@ impl App {
         self.draw_sections_pane(frame, left, on_sections);
         self.last_section_pane_area = left;
 
+        if self.section_filter_has_no_matches() {
+            self.last_main_area = Rect::default();
+            self.last_tab_area = None;
+            render_no_matches(frame, right);
+            return;
+        }
+        if self.loaded_section != Some(self.section_cursor) {
+            self.last_main_area = Rect::default();
+            self.last_tab_area = None;
+            self.draw_section_detail_hint(frame, right);
+            self.draw_status(frame, regions(right));
+            return;
+        }
+
         // Clone values out of `screen` so draw methods can take `&mut self`.
         // The right pane renders the loaded section content whether focus is on
         // the sections list (preview) or the detail (active).
@@ -644,7 +704,7 @@ impl App {
 
         match &self.screen {
             Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     let help = crate::i18n::t("zc-config-footer-action-help");
                     format!(
                         " {}  {}={}  {}={}  ?={}",
@@ -700,7 +760,7 @@ impl App {
             }
             Screen::FieldEdit { field_idx, .. } => {
                 if self.is_select_edit() {
-                    if self.filter.is_some() {
+                    if self.detail_filter().is_some() {
                         let help = crate::i18n::t("zc-config-footer-action-help");
                         format!(
                             " {}  {}={}  {}={}  ?={}",
@@ -792,6 +852,38 @@ impl App {
     /// Handle a key event. Returns `Ok(true)` when the user wants to
     /// quit the entire TUI (never triggered from Config; use Ctrl+C at the app level).
     pub(crate) async fn handle_key(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        let result = self.handle_key_inner(key, term).await;
+        self.settle_handler_result(result, false)
+    }
+
+    /// Shared exit path of `handle_key` / `handle_mouse`: an RPC timeout is
+    /// absorbed into the status line and replaced by `absorbed` (for keys,
+    /// `false` = do not quit); every other result passes through unchanged.
+    fn settle_handler_result<T>(&mut self, result: Result<T>, absorbed: T) -> Result<T> {
+        match result {
+            Err(error) if self.absorb_rpc_timeout(&error) => Ok(absorbed),
+            other => other,
+        }
+    }
+
+    /// A per-call RPC deadline (`DaemonRpcTimeout`) means the daemon is busy
+    /// on that one method, not that the connection is gone. Surfacing it as
+    /// a status line keeps the TUI alive; letting it unwind through
+    /// `app::run` used to exit the whole process (observed on `config/list`
+    /// while a route-affecting `config/set` was queued behind a running
+    /// turn). Returns `true` when the error was absorbed.
+    fn absorb_rpc_timeout(&mut self, error: &anyhow::Error) -> bool {
+        if crate::client::DaemonRpcTimeout::from_anyhow(error).is_none() {
+            return false;
+        }
+        self.status_msg = Some(crate::i18n::t_args(
+            "zc-config-status-load-failed",
+            &[("err", &format!("{error:#}"))],
+        ));
+        true
+    }
+
+    async fn handle_key_inner(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
         self.status_msg = None;
 
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
@@ -821,6 +913,15 @@ impl App {
             return Ok(false);
         }
 
+        // Search cancellation takes precedence over drill/back navigation.
+        if self.filter.is_some()
+            && crate::keymap::SearchBoxAction::from_chord(&key)
+                == Some(crate::keymap::SearchBoxAction::Cancel)
+        {
+            self.cancel_filter().await?;
+            return Ok(false);
+        }
+
         // Focus on the section list: keys drive the list (which eagerly loads
         // the highlighted section into the right pane for preview). Focus on the
         // detail: keys drive whatever drill screen is loaded.
@@ -837,6 +938,7 @@ impl App {
                 ConfigTabAction::from_chord(&key),
                 Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
             ) && self.at_section_top_level()
+                && self.filter.is_none()
             {
                 self.zeroclaw_pane = ZeroclawPane::Sections;
                 return Ok(false);
@@ -864,6 +966,7 @@ impl App {
     }
 
     fn cycle_section(&mut self, delta: isize) {
+        self.deactivate_filter();
         let i = CONFIG_SECTIONS
             .iter()
             .position(|s| *s == self.section)
@@ -874,6 +977,16 @@ impl App {
 
     /// Handle a mouse event forwarded from the app event loop.
     pub(crate) async fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        area: Rect,
+        term: &mut Term,
+    ) -> Result<()> {
+        let result = self.handle_mouse_inner(mouse, area, term).await;
+        self.settle_handler_result(result, ())
+    }
+
+    async fn handle_mouse_inner(
         &mut self,
         mouse: MouseEvent,
         _area: Rect,
@@ -888,6 +1001,7 @@ impl App {
         {
             let labels: Vec<&str> = CONFIG_SECTIONS.iter().map(|s| s.label()).collect();
             if let Some(idx) = mouse::tab_click_index(mouse.column, mouse.row, bar, &labels, 3) {
+                self.deactivate_filter();
                 self.section = CONFIG_SECTIONS[idx];
                 return Ok(());
             }
@@ -896,6 +1010,13 @@ impl App {
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_mouse(mouse);
             self.sync_zerocode_locales().await;
+            return Ok(());
+        }
+
+        if self.section_filter_has_no_matches()
+            || (self.loaded_section != Some(self.section_cursor)
+                && !mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area))
+        {
             return Ok(());
         }
 
@@ -979,16 +1100,30 @@ impl App {
                         self.last_section_rows.len(),
                     ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
+                        if self.detail_filter().is_some() {
+                            self.deactivate_filter();
+                        }
+                        if self.filter_for(ZeroclawPane::Sections).is_some() {
+                            let labels: Vec<&str> =
+                                self.sections.iter().map(|s| s.label.as_str()).collect();
+                            let visible = self.filtered_section_indices(&labels);
+                            self.filter_cursor =
+                                visible.iter().position(|&i| i == orig).unwrap_or(0);
+                        }
                         self.section_cursor = orig;
+                        self.zeroclaw_pane = ZeroclawPane::Sections;
+                        self.preview_section(orig).await?;
+                        self.status_msg = None;
                     }
-                    self.zeroclaw_pane = ZeroclawPane::Sections;
-                    self.preview_section(self.section_cursor).await?;
-                    self.status_msg = None;
                     return Ok(());
                 }
 
                 // List area click.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) {
+                    if self.filter_for(ZeroclawPane::Sections).is_some() {
+                        self.deactivate_filter();
+                    }
+                    self.zeroclaw_pane = ZeroclawPane::Detail;
                     let count = self.visible_count();
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
@@ -1008,23 +1143,22 @@ impl App {
             // Scroll over the pinned section list moves the section highlight and
             // re-previews — works whether focus is on the sections or the detail.
             MouseEventKind::ScrollUp
-                if self.section_cursor > 0
-                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+                if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
             {
-                self.section_cursor -= 1;
-                self.preview_section(self.section_cursor).await?;
+                self.scroll_sections(true).await?;
             }
             MouseEventKind::ScrollDown
-                if self.section_cursor + 1 < self.sections.len()
-                    && mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
+                if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) =>
             {
-                self.section_cursor += 1;
-                self.preview_section(self.section_cursor).await?;
+                self.scroll_sections(false).await?;
             }
 
             MouseEventKind::ScrollUp
                 if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) =>
             {
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
+                    self.deactivate_filter();
+                }
                 let cur = self.visible_cursor();
                 let count = self.visible_count();
                 let next = mouse::list_scroll(cur, count, true, 3);
@@ -1034,6 +1168,9 @@ impl App {
             MouseEventKind::ScrollDown
                 if mouse::in_rect(mouse.column, mouse.row, self.last_main_area) =>
             {
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
+                    self.deactivate_filter();
+                }
                 let cur = self.visible_cursor();
                 let count = self.visible_count();
                 let next = mouse::list_scroll(cur, count, false, 3);
@@ -1047,12 +1184,33 @@ impl App {
 
     // ── Mouse helper methods ─────────────────────────────────────
 
+    async fn scroll_sections(&mut self, up: bool) -> Result<()> {
+        let labels: Vec<&str> = self.sections.iter().map(|s| s.label.as_str()).collect();
+        let visible = self.filtered_section_indices(&labels);
+        let cursor = visible
+            .iter()
+            .position(|&i| i == self.section_cursor)
+            .unwrap_or(0);
+        let next = crate::mouse::list_scroll(cursor, visible.len(), up, 1);
+        if let Some(&orig) = visible.get(next) {
+            if self.detail_filter().is_some() {
+                self.deactivate_filter();
+            }
+            if self.filter_for(ZeroclawPane::Sections).is_some() {
+                self.filter_cursor = next;
+            }
+            self.section_cursor = orig;
+            self.preview_section(orig).await?;
+        }
+        Ok(())
+    }
+
     /// Number of visible items for the current screen (respecting filters).
     fn visible_count(&self) -> usize {
         match &self.screen {
             Screen::SectionList => {
                 let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-                self.filtered_indices(&labels).len()
+                self.filtered_section_indices(&labels).len()
             }
             Screen::TypeList { section_idx } => {
                 let names = self.type_list_labels(*section_idx);
@@ -1064,7 +1222,7 @@ impl App {
                 } else {
                     let vis = self.filtered_indices(&self.aliases);
                     // +1 for [+ Add] when not filtering
-                    if self.filter.is_none() {
+                    if self.detail_filter().is_none() {
                         vis.len() + 1
                     } else {
                         vis.len()
@@ -1145,19 +1303,19 @@ impl App {
     fn visible_cursor(&self) -> usize {
         match &self.screen {
             Screen::SectionList => {
-                if self.filter.is_some() {
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
                     self.filter_cursor
                 } else {
                     let labels: Vec<String> =
                         self.sections.iter().map(|s| s.label.clone()).collect();
-                    self.filtered_indices(&labels)
+                    self.filtered_section_indices(&labels)
                         .iter()
                         .position(|&i| i == self.section_cursor)
                         .unwrap_or(0)
                 }
             }
             Screen::TypeList { section_idx } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     self.filter_cursor
                 } else {
                     let names = self.type_list_labels(*section_idx);
@@ -1170,7 +1328,7 @@ impl App {
             Screen::AliasList { .. } => {
                 if self.alias_list_has_tabs() && self.alias_tab == 1 {
                     self.cost_cursor
-                } else if self.filter.is_some() {
+                } else if self.detail_filter().is_some() {
                     self.filter_cursor
                 } else {
                     self.alias_cursor
@@ -1189,7 +1347,7 @@ impl App {
                 }
             }
             Screen::FieldEdit { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     self.filter_cursor
                 } else {
                     self.select_cursor
@@ -1200,7 +1358,7 @@ impl App {
 
     /// Helper: current field cursor in visible coordinates.
     fn visible_field_cursor(&self) -> usize {
-        if self.filter.is_some() {
+        if self.detail_filter().is_some() {
             return self.filter_cursor;
         }
         let tab_indices = self.tab_field_indices();
@@ -1218,8 +1376,8 @@ impl App {
         match &self.screen {
             Screen::SectionList => {
                 let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-                let visible = self.filtered_indices(&labels);
-                if self.filter.is_some() {
+                let visible = self.filtered_section_indices(&labels);
+                if self.filter_for(ZeroclawPane::Sections).is_some() {
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else if let Some(&orig) = visible.get(pos) {
                     self.section_cursor = orig;
@@ -1228,7 +1386,7 @@ impl App {
             Screen::TypeList { section_idx } => {
                 let names = self.type_list_labels(*section_idx);
                 let visible = self.filtered_indices(&names);
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else if let Some(&orig) = visible.get(pos) {
                     self.type_cursor = orig;
@@ -1238,11 +1396,11 @@ impl App {
                 if self.alias_list_has_tabs() && self.alias_tab == 1 {
                     let total = self.cost_resources.len() + 1; // +1 for [+ Add]
                     self.cost_cursor = pos.min(total.saturating_sub(1));
-                } else if self.filter.is_some() {
+                } else if self.detail_filter().is_some() {
                     let visible = self.filtered_indices(&self.aliases);
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                 } else {
-                    let total = if self.filter.is_none() {
+                    let total = if self.detail_filter().is_none() {
                         self.aliases.len() + 1 // +1 for [+ Add]
                     } else {
                         self.aliases.len()
@@ -1270,7 +1428,7 @@ impl App {
             Screen::FieldEdit { .. } => {
                 if self.is_select_edit() {
                     let visible = self.filtered_indices(&self.select_items);
-                    if self.filter.is_some() {
+                    if self.detail_filter().is_some() {
                         self.filter_cursor = pos.min(visible.len().saturating_sub(1));
                     } else if pos < visible.len() {
                         self.select_cursor = pos;
@@ -1286,7 +1444,7 @@ impl App {
         let tab_names = self.field_labels_for_tab(&tab_indices);
         let filter_vis = self.filtered_indices(&tab_names);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
-        if self.filter.is_some() {
+        if self.detail_filter().is_some() {
             self.filter_cursor = pos.min(filter_vis.len().saturating_sub(1));
         } else if let Some(&orig) = visible.get(pos) {
             self.field_cursor = orig;
@@ -1299,7 +1457,7 @@ impl App {
         };
         let names = self.type_list_labels(*section_idx);
         let visible = self.filtered_indices(&names);
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             visible.iter().position(|&i| i == self.type_cursor)?
@@ -1316,6 +1474,7 @@ impl App {
             }
             Screen::TypeList { .. } => {
                 if let Some(idx) = self.selected_type_row() {
+                    self.deactivate_filter();
                     self.enter_type(idx).await?;
                 }
             }
@@ -1325,9 +1484,12 @@ impl App {
                         let idx = self.cost_cursor;
                         self.enter_cost_resource(idx).await?;
                     }
-                } else if self.alias_cursor < self.aliases.len() {
-                    let idx = self.alias_cursor;
-                    self.enter_alias(idx).await?;
+                } else {
+                    let visible = self.filtered_indices(&self.aliases);
+                    if let Some(&idx) = visible.get(self.visible_cursor()) {
+                        self.deactivate_filter();
+                        self.enter_alias(idx).await?;
+                    }
                 }
                 // If on [+ Add], double-click does nothing — use keyboard.
             }
@@ -1337,19 +1499,28 @@ impl App {
                     // Double-click on personality file or skill opens editor —
                     // that requires async loading which mirrors the Enter key
                     // handler. For now, no-op on composite tabs.
-                } else if self.field_cursor < self.fields.len() {
-                    self.enter_field_edit(self.field_cursor, term).await;
+                } else {
+                    let tab_indices = self.tab_field_indices();
+                    let labels = self.field_labels_for_tab(&tab_indices);
+                    let visible = self.filtered_indices(&labels);
+                    if let Some(&pos) = visible.get(self.visible_field_cursor()) {
+                        let idx = tab_indices[pos];
+                        self.deactivate_filter();
+                        self.field_cursor = idx;
+                        self.enter_field_edit(idx, term).await;
+                    }
                 }
             }
             Screen::FieldEdit { .. } => {
                 if self.is_select_edit() {
                     let visible = self.filtered_indices(&self.select_items);
-                    let cursor = if self.filter.is_some() {
+                    let cursor = if self.detail_filter().is_some() {
                         self.filter_cursor
                     } else {
                         self.select_cursor
                     };
                     if let Some(&orig) = visible.get(cursor) {
+                        self.deactivate_filter();
                         self.commit_select(orig).await?;
                     }
                 }
@@ -1736,7 +1907,7 @@ impl App {
 
     async fn handle_section_list(&mut self, key: KeyEvent) -> Result<bool> {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-        let visible = self.filtered_indices(&labels);
+        let visible = self.filtered_section_indices(&labels);
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => {
@@ -1744,11 +1915,17 @@ impl App {
                 // `filter_cursor`; resolve the highlighted filtered row back to
                 // its underlying section so the right-pane preview matches what
                 // `draw_sections_pane` highlights and what Enter will open.
-                let visible = self.filtered_indices(&labels);
+                let visible = self.filtered_section_indices(&labels);
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.section_cursor = orig;
                 }
-                self.preview_section(self.section_cursor).await?;
+                if !visible.is_empty() {
+                    self.preview_section(self.section_cursor).await?;
+                }
+                return Ok(false);
+            }
+            FilterAction::Cancel => {
+                self.cancel_filter().await?;
                 return Ok(false);
             }
             FilterAction::Accept => {
@@ -1909,6 +2086,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -2011,7 +2189,7 @@ impl App {
 
         let visible = self.filtered_indices(&self.aliases);
         // +1 for [+ Add] (only when not filtering)
-        let has_add = self.filter.is_none();
+        let has_add = self.detail_filter().is_none();
         let visible_total = if has_add {
             visible.len() + 1
         } else {
@@ -2020,6 +2198,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -2422,6 +2601,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -2493,6 +2673,16 @@ impl App {
             }
             Some(ConfigTabAction::Enter) if visible.contains(&self.field_cursor) => {
                 self.enter_field_edit(self.field_cursor, term).await;
+            }
+            Some(ConfigTabAction::DeleteRow)
+                if self
+                    .fields
+                    .get(self.field_cursor)
+                    .is_some_and(|field| field.kind == PropKind::SecretMap) =>
+            {
+                // The container row is not itself a value; entries are
+                // removed from their own `<path>.<KEY>` rows.
+                self.status_msg = Some(crate::i18n::t("zc-config-secret-map-delete-hint"));
             }
             Some(ConfigTabAction::DeleteRow) => {
                 if let Some(field) = self.fields.get(self.field_cursor) {
@@ -3146,6 +3336,7 @@ impl App {
 
     fn prepare_edit_at(&mut self, idx: usize) {
         let kind = self.fields[idx].kind;
+        self.secret_map_entry_key = None;
         let value = if self.fields[idx].populated {
             self.fields[idx]
                 .value
@@ -3197,17 +3388,145 @@ impl App {
 
     // ── Filter helpers ───────────────────────────────────────────
 
-    fn activate_filter(&mut self) {
+    fn activate_filter(&mut self, filtered_len: usize) {
+        let cursor = if self.zeroclaw_pane == ZeroclawPane::Sections {
+            self.section_cursor
+        } else {
+            self.visible_cursor()
+        };
+        let detail = (self.zeroclaw_pane == ZeroclawPane::Sections).then(|| DetailOrigin {
+            screen: self.screen.clone(),
+            loaded_section: self.loaded_section,
+            type_cursor: self.type_cursor,
+            alias_cursor: self.alias_cursor,
+            alias_tab: self.alias_tab,
+            cost_cursor: self.cost_cursor,
+            field_cursor: self.field_cursor,
+        });
+        self.filter_origin = Some(FilterOrigin {
+            pane: self.zeroclaw_pane,
+            section_cursor: self.section_cursor,
+            active_tab: self.active_tab,
+            detail,
+        });
         self.filter = Some(String::new());
-        self.filter_cursor = 0;
+        self.filter_cursor = cursor.min(filtered_len.saturating_sub(1));
     }
 
     fn deactivate_filter(&mut self) {
         self.filter = None;
+        self.filter_origin = None;
+    }
+
+    async fn cancel_filter(&mut self) -> Result<()> {
+        let origin = self.filter_origin.take();
+        self.deactivate_filter();
+        if let Some(origin) = origin {
+            self.zeroclaw_pane = origin.pane;
+            self.section_cursor = origin.section_cursor;
+            if origin.pane == ZeroclawPane::Sections {
+                let restored = match origin.detail {
+                    Some(detail) if detail.loaded_section != self.loaded_section => {
+                        self.reopen_detail(detail, origin.active_tab).await
+                    }
+                    _ => self.preview_section(origin.section_cursor).await,
+                };
+                if let Err(err) = restored {
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-load-failed",
+                        &[("err", &err.to_string())],
+                    ));
+                }
+                self.active_tab = origin
+                    .active_tab
+                    .min(self.tab_names.len().saturating_sub(1));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reload the detail page saved when a sidebar search started, with its
+    /// cursors and tab. Pages that hold unsaved input (an open editor or a
+    /// create form) fall back to their section root.
+    async fn reopen_detail(&mut self, detail: DetailOrigin, active_tab: usize) -> Result<()> {
+        let Some(section_idx) = detail.loaded_section else {
+            return Ok(());
+        };
+        match detail.screen {
+            Screen::AliasList {
+                section_idx,
+                map_path,
+                breadcrumb,
+            } => {
+                self.load_aliases(&map_path).await?;
+                self.screen = Screen::AliasList {
+                    section_idx,
+                    map_path,
+                    breadcrumb,
+                };
+                if detail.alias_tab == 1 {
+                    self.alias_tab = 1;
+                    self.load_cost_resources().await?;
+                }
+                self.alias_cursor = detail.alias_cursor.min(self.aliases.len());
+                self.cost_cursor = detail.cost_cursor.min(self.cost_resources.len());
+            }
+            Screen::FieldList {
+                section_idx,
+                prefix,
+                breadcrumb,
+            } => {
+                self.load_fields(&prefix).await?;
+                self.screen = Screen::FieldList {
+                    section_idx,
+                    prefix,
+                    breadcrumb,
+                };
+                self.field_cursor = detail.field_cursor.min(self.fields.len().saturating_sub(1));
+                self.active_tab = active_tab.min(self.tab_names.len().saturating_sub(1));
+            }
+            _ => {
+                self.load_section_content(section_idx).await?;
+                self.type_cursor = detail
+                    .type_cursor
+                    .min(self.type_list_len(section_idx).saturating_sub(1));
+            }
+        }
+        self.loaded_section = Some(section_idx);
+        self.status_msg = None;
+        Ok(())
+    }
+
+    fn filter_for(&self, pane: ZeroclawPane) -> Option<&String> {
+        self.filter_origin
+            .as_ref()
+            .filter(|origin| origin.pane == pane)
+            .and(self.filter.as_ref())
+    }
+
+    fn detail_filter(&self) -> Option<&String> {
+        self.filter_for(ZeroclawPane::Detail)
+    }
+
+    fn filtered_section_indices<S: AsRef<str>>(&self, items: &[S]) -> Vec<usize> {
+        Self::indices_matching(items, self.filter_for(ZeroclawPane::Sections))
+    }
+
+    fn section_filter_has_no_matches(&self) -> bool {
+        self.filter_for(ZeroclawPane::Sections).is_some()
+            && self
+                .filtered_section_indices(
+                    &self.sections.iter().map(|s| &s.label).collect::<Vec<_>>(),
+                )
+                .is_empty()
     }
 
     fn filtered_indices<S: AsRef<str>>(&self, items: &[S]) -> Vec<usize> {
-        match &self.filter {
+        Self::indices_matching(items, self.detail_filter())
+    }
+
+    fn indices_matching<S: AsRef<str>>(items: &[S], query: Option<&String>) -> Vec<usize> {
+        match query {
             None => (0..items.len()).collect(),
             Some(buf) if buf.is_empty() => (0..items.len()).collect(),
             Some(buf) => {
@@ -3226,7 +3545,7 @@ impl App {
         use crate::keymap::{ConfigTabAction, SearchBoxAction};
         if self.filter.is_none() {
             if ConfigTabAction::from_chord(&key) == Some(ConfigTabAction::BeginSearch) {
-                self.activate_filter();
+                self.activate_filter(filtered_len);
                 return FilterAction::Consumed;
             }
             return FilterAction::Passthrough;
@@ -3240,17 +3559,12 @@ impl App {
             None => None,
         };
         match editor_chord {
-            Some(FilterEditAction::Cancel) => {
-                self.deactivate_filter();
-                FilterAction::Consumed
-            }
+            Some(FilterEditAction::Cancel) => FilterAction::Cancel,
             Some(FilterEditAction::Accept) => FilterAction::Accept,
             Some(FilterEditAction::Backspace) => {
                 if let Some(buf) = &mut self.filter {
                     buf.pop();
-                    if self.filter_cursor >= filtered_len {
-                        self.filter_cursor = filtered_len.saturating_sub(1);
-                    }
+                    self.filter_cursor = 0;
                 }
                 FilterAction::Consumed
             }
@@ -3313,6 +3627,50 @@ impl App {
             ConfigEditorAction::CursorEnd => self.edit_buf.len(),
             _ => self.edit_cursor,
         };
+    }
+
+    /// Advance the two-step "add entry" flow on a `PropKind::SecretMap`
+    /// row. Step 1 takes the entry key; step 2 takes its value and writes
+    /// `<map_path>.<key>`. An existing key is simply replaced. Empty values
+    /// are refused here because the daemon treats "" as "remove entry".
+    async fn confirm_secret_map_step(&mut self, map_path: &str) -> Result<()> {
+        let Some(key) = self.secret_map_entry_key.clone() else {
+            let key = self.edit_buf.trim().to_string();
+            if let Some(status_key) = secret_map_key_validation_key(&key) {
+                self.status_msg = Some(crate::i18n::t(status_key));
+                return Ok(());
+            }
+            self.secret_map_entry_key = Some(key);
+            self.edit_buf.clear();
+            self.edit_cursor = 0;
+            self.status_msg = None;
+            return Ok(());
+        };
+        if self.edit_buf.is_empty() {
+            self.status_msg = Some(crate::i18n::t("zc-config-secret-map-value-empty"));
+            return Ok(());
+        }
+        let prop = format!("{map_path}.{key}");
+        let value = serde_json::Value::String(self.edit_buf.clone());
+        match self.rpc.config_set(&prop, value).await {
+            Ok(()) => {
+                self.secret_map_entry_key = None;
+                self.edit_buf.clear();
+                self.edit_cursor = 0;
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-field-set",
+                    &[("prop", &prop)],
+                ));
+                self.pop_to_field_list_keep_cursor().await?;
+            }
+            Err(e) => {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-set-failed",
+                    &[("err", &e.to_string())],
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn is_scalar_field_edit(&self) -> bool {
@@ -3390,6 +3748,12 @@ impl App {
                 self.pop_to_field_list().await?;
             }
             Some(ConfigEditorAction::Confirm) => {
+                if let Screen::FieldEdit { field_idx, .. } = &self.screen
+                    && self.fields[*field_idx].kind == PropKind::SecretMap
+                {
+                    let map_path = self.fields[*field_idx].path.clone();
+                    return self.confirm_secret_map_step(&map_path).await;
+                }
                 if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                     let field = &self.fields[*field_idx];
                     if let Some(status) =
@@ -3448,6 +3812,7 @@ impl App {
 
         match self.handle_filter_key(key, visible.len()) {
             FilterAction::Consumed => return Ok(()),
+            FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
                     self.deactivate_filter();
@@ -3574,8 +3939,13 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, rows[0], buf);
+        if let Some(buf) = self.filter_for(ZeroclawPane::Sections) {
+            render_filter_bar(
+                frame,
+                rows[0],
+                buf,
+                &crate::i18n::t("zc-config-filter-sections"),
+            );
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -3588,9 +3958,9 @@ impl App {
         let list_area = rows[1];
 
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
-        let visible = self.filtered_indices(&labels);
+        let visible = self.filtered_section_indices(&labels);
 
-        let grouped = self.filter.is_none()
+        let grouped = self.filter_for(ZeroclawPane::Sections).is_none()
             && self
                 .sections
                 .iter()
@@ -3624,7 +3994,7 @@ impl App {
             row_map.push(Some(i));
         }
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.filter_for(ZeroclawPane::Sections).is_some() {
             self.filter_cursor
         } else {
             row_map
@@ -3658,6 +4028,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_section_list_offset = state.offset();
         self.last_tab_area = None;
+        if self.section_filter_has_no_matches() {
+            render_no_matches(frame, list_area);
+        }
     }
 
     /// Right pane shown while focus is on the section list: the highlighted
@@ -3701,8 +4074,8 @@ impl App {
 
         render_breadcrumb(frame, r.breadcrumb, std::slice::from_ref(&section.label));
 
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, r.help, buf);
+        if let Some(buf) = self.detail_filter() {
+            render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(&section.help, theme::dim_style()))
@@ -3730,7 +4103,7 @@ impl App {
             })
             .collect();
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             visible
@@ -3757,6 +4130,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = None;
 
+        if self.detail_filter().is_some() && visible.is_empty() {
+            render_no_matches(frame, r.main);
+        }
         self.draw_status(frame, r);
     }
 
@@ -3812,8 +4188,8 @@ impl App {
             return;
         }
 
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, r.help, buf);
+        if let Some(buf) = self.detail_filter() {
+            render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(&section.help, theme::dim_style()))
@@ -3839,14 +4215,14 @@ impl App {
             .collect();
 
         // Only show [+ Add] when not filtering
-        if self.filter.is_none() {
+        if self.detail_filter().is_none() {
             items.push(ListItem::new(Line::from(Span::styled(
                 "[+ Add]",
                 theme::accent_style(),
             ))));
         }
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             self.alias_cursor
@@ -3870,6 +4246,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
+        if self.detail_filter().is_some() && visible.is_empty() {
+            render_no_matches(frame, r.main);
+        }
         self.draw_status(frame, r);
     }
 
@@ -4016,8 +4395,8 @@ impl App {
         let filter_vis = self.filtered_indices(&tab_names);
         let visible: Vec<usize> = filter_vis.iter().map(|&fi| tab_indices[fi]).collect();
 
-        if let Some(buf) = &self.filter {
-            render_filter_bar(frame, r.help, buf);
+        if let Some(buf) = self.detail_filter() {
+            render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else if let Some(field) = self.fields.get(self.field_cursor) {
             frame.render_widget(
                 Paragraph::new(Span::styled(&field.description, theme::dim_style()))
@@ -4026,7 +4405,7 @@ impl App {
             );
         }
 
-        let cursor = if self.filter.is_some() {
+        let cursor = if self.detail_filter().is_some() {
             self.filter_cursor
         } else {
             visible
@@ -4042,7 +4421,11 @@ impl App {
                 let f = &self.fields[i];
                 let short_name =
                     &tab_names[tab_indices.iter().position(|&ti| ti == i).unwrap_or(0)];
-                let val_display = if f.is_secret {
+                let val_display = if f.kind == PropKind::SecretMap {
+                    // Entries are listed as their own `<path>.<KEY>` rows;
+                    // the container row is the add affordance.
+                    crate::i18n::t("zc-config-secret-map-add")
+                } else if f.is_secret {
                     "••••••".to_string()
                 } else {
                     f.value
@@ -4093,6 +4476,9 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
+        if self.detail_filter().is_some() && visible.is_empty() {
+            render_no_matches(frame, r.main);
+        }
         self.draw_status(frame, r);
     }
 
@@ -4299,8 +4685,13 @@ impl App {
 
         if self.is_select_edit() {
             // Enum, Bool, or model select — with optional `/` filter.
-            if let Some(buf) = &self.filter {
-                render_filter_bar(frame, r.help, buf);
+            if let Some(buf) = self.detail_filter() {
+                render_filter_bar(
+                    frame,
+                    r.help,
+                    buf,
+                    &crate::i18n::t("zc-config-filter-options"),
+                );
             } else {
                 frame.render_widget(
                     Paragraph::new(Span::styled(&field.description, theme::dim_style()))
@@ -4320,7 +4711,7 @@ impl App {
                 })
                 .collect();
 
-            let cursor = if self.filter.is_some() {
+            let cursor = if self.detail_filter().is_some() {
                 self.filter_cursor
             } else {
                 self.select_cursor
@@ -4349,6 +4740,9 @@ impl App {
             self.last_list_offset = state.offset();
             self.last_tab_area = None;
 
+            if self.detail_filter().is_some() && visible.is_empty() {
+                render_no_matches(frame, r.main);
+            }
             self.draw_status(frame, r);
         } else {
             // Text input (masked for secrets) — help text always visible.
@@ -4397,6 +4791,34 @@ impl App {
                 return;
             }
 
+            if field.kind == PropKind::SecretMap {
+                // Two-step add: key in clear text, then its value masked.
+                let (hint, masked, title) = match &self.secret_map_entry_key {
+                    None => (
+                        crate::i18n::t("zc-config-secret-map-key-prompt"),
+                        false,
+                        format!(" {short_name} \u{203a} + "),
+                    ),
+                    Some(key) => (
+                        crate::i18n::t_args(
+                            "zc-config-secret-map-value-prompt",
+                            &[("key", key.as_str())],
+                        ),
+                        true,
+                        format!(" {short_name} \u{203a} {key} "),
+                    ),
+                };
+                let input_display = scalar_edit_display(&self.edit_buf, self.edit_cursor, masked);
+                let input = Paragraph::new(vec![
+                    Line::from(Span::styled(hint, theme::dim_style())),
+                    Line::from(Span::styled(input_display, theme::input_style())),
+                ])
+                .block(theme::panel_block(&title));
+                frame.render_widget(input, r.main);
+                self.draw_status(frame, r);
+                return;
+            }
+
             let input_display =
                 scalar_edit_display(&self.edit_buf, self.edit_cursor, field.is_secret);
 
@@ -4427,7 +4849,7 @@ impl App {
     /// text-input surface is currently active (filter, edit buffer, alias
     /// create, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
-    pub(crate) fn handle_paste(&mut self, text: &str) {
+    pub(crate) async fn handle_paste(&mut self, text: &str) {
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
         // or \n depending on terminal.
         let cleaned: String = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -4439,6 +4861,19 @@ impl App {
                     continue;
                 } // filter is single-line
                 buf.push(c);
+            }
+            self.filter_cursor = 0;
+            if self.filter_for(ZeroclawPane::Sections).is_some() {
+                let labels: Vec<&str> = self.sections.iter().map(|s| s.label.as_str()).collect();
+                if let Some(&orig) = self.filtered_section_indices(&labels).first() {
+                    self.section_cursor = orig;
+                    if let Err(err) = self.preview_section(orig).await {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-load-failed",
+                            &[("err", &err.to_string())],
+                        ));
+                    }
+                }
             }
             return;
         }
@@ -4512,6 +4947,15 @@ impl App {
                 )
             )
     }
+
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        if self.section == ConfigSection::Zerocode {
+            return self.zerocode.claims_session_shortcut(key);
+        }
+        self.wants_text_input()
+            || crate::keymap::ConfigTabAction::from_chord(key).is_some()
+            || crate::keymap::ConfigEditorAction::from_chord(key).is_some()
+    }
 }
 
 fn scalar_edit_display(text: &str, cursor: usize, secret: bool) -> String {
@@ -4577,9 +5021,21 @@ impl App {
         let back = || k(A::Back, "zc-config-help-back");
         let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
 
+        if self.zeroclaw_pane == ZeroclawPane::Sections {
+            let mut entries = vec![nav(), k(A::Enter, "zc-config-help-open-section")];
+            if self.filter_for(ZeroclawPane::Sections).is_some() {
+                entries.push(clear_filter());
+            } else {
+                entries.push(filter());
+            }
+            entries.push(help());
+            entries.push(mouse_open());
+            return HelpNode::entries(entries);
+        }
+
         match &self.screen {
             Screen::SectionList => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-open-section"),
@@ -4600,7 +5056,7 @@ impl App {
                 }
             }
             Screen::TypeList { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-open-type"),
@@ -4621,7 +5077,7 @@ impl App {
                 }
             }
             Screen::AliasList { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-open-alias"),
@@ -4668,7 +5124,7 @@ impl App {
                 help(),
             ]),
             Screen::FieldList { .. } => {
-                if self.filter.is_some() {
+                if self.detail_filter().is_some() {
                     HelpNode::entries(vec![
                         nav(),
                         k(A::Enter, "zc-config-help-edit-field"),
@@ -4748,7 +5204,7 @@ impl App {
                     .map(|f| f.kind == PropKind::StringArray)
                     .unwrap_or(false);
                 if self.is_select_edit() {
-                    if self.filter.is_some() {
+                    if self.detail_filter().is_some() {
                         HelpNode::entries(vec![
                             nav(),
                             k(A::Enter, "zc-config-help-save-selection"),
@@ -4875,10 +5331,19 @@ fn regions(area: Rect) -> Regions {
     }
 }
 
-fn render_filter_bar(frame: &mut Frame, area: Rect, buf: &str) {
-    let display = format!("/{buf}█");
+fn render_filter_bar(frame: &mut Frame, area: Rect, buf: &str, scope: &str) {
+    let display = format!("{scope}: /{buf}█");
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(display, theme::input_style()))),
+        area,
+    );
+}
+
+fn render_no_matches(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(crate::i18n::t("zc-config-filter-no-matches"))
+            .style(theme::dim_style())
+            .block(theme::panel_block(" ")),
         area,
     );
 }
@@ -5135,12 +5600,687 @@ mod tests {
         );
     }
 
+    /// Fake daemon reply policy for the handler-level timeout tests.
+    const DAEMON_SILENT: u8 = 0;
+    const DAEMON_ANSWER: u8 = 1;
+    const DAEMON_FAIL: u8 = 2;
+
+    /// A config manager wired to an in-process fake daemon. The daemon reads
+    /// every request frame the client sends, records its method, and then
+    /// stays silent (so the client's own 5s `call` deadline fires), answers
+    /// with an empty field list, or answers with a JSON-RPC error, per
+    /// `mode`.
+    fn manager_with_fake_daemon() -> (
+        App,
+        Arc<std::sync::atomic::AtomicU8>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mode = Arc::new(AtomicU8::new(DAEMON_SILENT));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (daemon_mode, daemon_seen) = (mode.clone(), seen.clone());
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let request: serde_json::Value =
+                    serde_json::from_str(&frame).expect("client sends JSON-RPC frames");
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                daemon_seen
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap_or_default().to_string());
+                match daemon_mode.load(Ordering::SeqCst) {
+                    DAEMON_ANSWER => outbound.dispatch_response(
+                        &id,
+                        Some(serde_json::json!({ "entries": [] })),
+                        None,
+                    ),
+                    DAEMON_FAIL => outbound.dispatch_response(
+                        &id,
+                        None,
+                        Some(JsonRpcError {
+                            code: -32000,
+                            message: "boom".to_string(),
+                            data: None,
+                        }),
+                    ),
+                    _ => {}
+                }
+            }
+        });
+        let mut mgr = App::new(rpc, std::path::Path::new("/tmp"));
+        mgr.sections = vec![
+            entry_with_cost("alpha", ""),
+            entry_with_cost("beta", ""),
+            entry_with_cost("gamma", ""),
+        ];
+        (mgr, mode, seen)
+    }
+
+    /// The real handlers take the app's `Term`. A fixed viewport never
+    /// queries the tty, and the section-list paths these tests drive never
+    /// draw through it, so nothing is written to stdout.
+    fn handler_term() -> Term {
+        Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 160, 40)),
+            },
+        )
+        .expect("fixed-viewport terminal")
+    }
+
+    /// Render through `draw_into`, the same entry point `app::run` uses for
+    /// the Config mode, and return the screen as text.
+    fn render_config(mgr: &mut App) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        term.draw(|frame| {
+            let area = frame.area();
+            mgr.draw_into(frame, area);
+        })
+        .unwrap();
+        let buffer = term.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn mouse_at(kind: MouseEventKind, area: Rect) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: area.x + area.width / 2,
+            row: area.y + area.height / 2,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    // Paused clock: the client's real 5s `call` deadline elapses instantly.
+    #[tokio::test(start_paused = true)]
+    async fn config_pane_survives_rpc_timeout_on_real_key_and_mouse_input() {
+        use std::sync::atomic::Ordering;
+        let (mut mgr, mode, seen) = manager_with_fake_daemon();
+        let mut term = handler_term();
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        // Like `init`, eagerly load the first section while the daemon
+        // answers, so the timeouts below land on a loaded detail screen whose
+        // existing status row shows them.
+        mode.store(DAEMON_ANSWER, Ordering::SeqCst);
+        mgr.load_section_content(0)
+            .await
+            .expect("first section loads");
+        mode.store(DAEMON_SILENT, Ordering::SeqCst);
+        render_config(&mut mgr);
+        let section_pane = mgr.last_section_pane_area;
+        let area = Rect::new(0, 0, 160, 40);
+
+        // Key: Down previews `beta`; its config/list gets no reply.
+        let quit = mgr.handle_key(down, &mut term).await;
+        assert!(
+            matches!(quit, Ok(false)),
+            "a timed-out RPC under a key must neither quit nor propagate: {quit:?}"
+        );
+        let screen = render_config(&mut mgr);
+        assert!(
+            screen.contains("config/list") && screen.contains("timed out after 5s"),
+            "timeout must be visible in the status line after a key:\n{screen}"
+        );
+
+        // Mouse: scrolling over the section pane previews `gamma`, also
+        // unanswered.
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollDown, section_pane),
+                area,
+                &mut term,
+            )
+            .await;
+        assert!(
+            scrolled.is_ok(),
+            "a timed-out RPC under a mouse event must not propagate: {scrolled:?}"
+        );
+        assert_eq!(mgr.section_cursor, 2);
+        let screen = render_config(&mut mgr);
+        assert!(
+            screen.contains("timed out after 5s"),
+            "timeout must be visible in the status line after a mouse event:\n{screen}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["config/list", "config/list", "config/list"],
+            "the initial load and both inputs must have reached the daemon"
+        );
+
+        // The daemon recovers: further key and mouse input works normally.
+        mode.store(DAEMON_ANSWER, Ordering::SeqCst);
+        let quit = mgr.handle_key(up, &mut term).await;
+        assert!(matches!(quit, Ok(false)), "{quit:?}");
+        assert_eq!(
+            mgr.loaded_section,
+            Some(1),
+            "Up must load `beta` once answered"
+        );
+        assert!(mgr.status_msg.is_none());
+        let screen = render_config(&mut mgr);
+        assert!(
+            !screen.contains("timed out"),
+            "status clears on the next successful input:\n{screen}"
+        );
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollUp, section_pane),
+                area,
+                &mut term,
+            )
+            .await;
+        assert!(scrolled.is_ok(), "{scrolled:?}");
+        assert_eq!(
+            mgr.loaded_section,
+            Some(0),
+            "scroll must load `alpha` once answered"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn config_pane_handlers_still_propagate_non_timeout_rpc_errors() {
+        use std::sync::atomic::Ordering;
+        let (mut mgr, mode, seen) = manager_with_fake_daemon();
+        mode.store(DAEMON_FAIL, Ordering::SeqCst);
+        let mut term = handler_term();
+        render_config(&mut mgr);
+        let section_pane = mgr.last_section_pane_area;
+
+        let quit = mgr
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+            .await;
+        let error = quit.expect_err("a daemon error is not a timeout and must propagate");
+        assert!(format!("{error:#}").contains("boom"), "{error:#}");
+        assert!(
+            mgr.status_msg.is_none(),
+            "only timeouts become a status line"
+        );
+
+        let scrolled = mgr
+            .handle_mouse(
+                mouse_at(MouseEventKind::ScrollDown, section_pane),
+                Rect::new(0, 0, 160, 40),
+                &mut term,
+            )
+            .await;
+        assert!(scrolled.is_err(), "mouse path must propagate it too");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
     fn test_manager() -> App {
         use crate::jsonrpc::RpcOutbound;
         use tokio::sync::mpsc;
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
         App::new(rpc, std::path::Path::new("/tmp"))
+    }
+
+    fn filter_test_term() -> Term {
+        Terminal::with_options(
+            WideCellCleanupBackend::new(io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap()
+    }
+
+    fn render_config_120(manager: &mut App) -> String {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn filter_fixture(manager: &mut App) {
+        manager.sections = vec![
+            entry_with_cost("Models", ""),
+            entry_with_cost("Agents", ""),
+            entry_with_cost("MCP", ""),
+        ];
+        manager.section_cursor = 1;
+        manager.loaded_section = Some(1);
+        manager.fields = vec![field("a.first"), field("a.second")];
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldList {
+            section_idx: 1,
+            prefix: "Agents".into(),
+            breadcrumb: vec!["Agents".into()],
+        };
+    }
+
+    #[tokio::test]
+    async fn config_filter_cancel_restores_section_preview_cursor_and_focus_after_paste() {
+        let (mut manager, calls) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.fields[0].tab = ConfigTab::Connection;
+        manager.fields[1].tab = ConfigTab::Advanced;
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 1);
+        manager.handle_paste("MCP\r\n").await;
+        assert_eq!(manager.section_cursor, 2);
+        assert_eq!(manager.loaded_section, Some(2));
+        assert_eq!(manager.filter_cursor, 0);
+        let rendered = render_config_120(&mut manager);
+        assert!(rendered.contains("Filter sections: /MCP"));
+        assert!(!rendered.contains("Filter list:"));
+        assert!(rendered.contains("first ="));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.filter.is_none());
+        assert_eq!(manager.section_cursor, 1);
+        assert_eq!(manager.loaded_section, Some(1));
+        assert_eq!(manager.field_cursor, 1);
+        assert_eq!(manager.active_tab, 1);
+        assert!(render_config_120(&mut manager).contains("second ="));
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Sections);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                crate::client::method::CONFIG_LIST,
+                crate::client::method::CONFIG_LIST
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_filter_model_picker_is_local_and_cancel_keeps_original_selection() {
+        let mut manager = test_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 1,
+            prefix: "Agents".into(),
+            breadcrumb: vec!["Agents".into()],
+            field_idx: 0,
+        };
+        manager.select_items = vec!["openai.default".into(), "ollama.local".into()];
+        manager.select_cursor = 1;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("openai").await;
+        let rendered = render_config_120(&mut manager);
+        assert!(rendered.contains("Models"));
+        assert!(rendered.contains("Agents"));
+        assert!(rendered.contains("MCP"));
+        assert!(rendered.contains("Filter options: /openai"));
+        assert!(!rendered.contains("ollama.local"));
+        assert!(!rendered.contains("Filter sections:"));
+        manager.handle_paste(".missing").await;
+        assert!(render_config_120(&mut manager).contains("No matches"));
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.select_cursor, 1);
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Detail);
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        assert!(render_config_120(&mut manager).contains("ollama.local"));
+    }
+
+    #[tokio::test]
+    async fn config_filter_empty_sections_disables_stale_preview_and_enter() {
+        let (mut manager, calls) = responding_manager();
+        filter_fixture(&mut manager);
+        let mut term = filter_test_term();
+        render_config_120(&mut manager);
+        let stale_main = manager.last_main_area;
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        for ch in "timeout".chars() {
+            manager
+                .handle_key(key(KeyCode::Char(ch)), &mut term)
+                .await
+                .unwrap();
+        }
+        let rendered = render_config_120(&mut manager);
+        assert_eq!(rendered.matches("No matches").count(), 2);
+        assert!(!rendered.contains("second ="));
+        assert!(manager.last_section_rows.is_empty());
+        assert_eq!(manager.last_main_area, Rect::default());
+        assert!(manager.last_tab_area.is_none());
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        for kind in [
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            MouseEventKind::ScrollDown,
+        ] {
+            manager
+                .handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column: stale_main.x + 2,
+                        row: stale_main.y + 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    Rect::new(0, 0, 120, 40),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(manager.section_cursor, 1);
+        assert_eq!(manager.field_cursor, 1);
+        assert!(calls.lock().unwrap().is_empty());
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section_cursor, 1);
+        assert!(render_config_120(&mut manager).contains("second ="));
+    }
+
+    #[tokio::test]
+    async fn config_filter_mouse_accepts_filtered_alias_and_discards_query() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::AliasList {
+            section_idx: 1,
+            map_path: "agents".into(),
+            breadcrumb: vec!["agents".into()],
+        };
+        manager.aliases = vec!["first".into(), "second".into()];
+        manager.alias_cursor = 0;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("second").await;
+        render_config_120(&mut manager);
+        let area = manager.last_main_area;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        manager
+            .handle_mouse(click, Rect::new(0, 0, 120, 40), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_mouse(click, Rect::new(0, 0, 120, 40), &mut term)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&manager.screen, Screen::FieldList { prefix, .. } if prefix == "agents.second")
+        );
+        assert!(manager.filter.is_none());
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Detail);
+    }
+
+    #[tokio::test]
+    async fn config_filter_field_cancel_precedes_top_level_back_and_tab_change_discards_query() {
+        let mut manager = test_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("missing").await;
+        assert!(render_config_120(&mut manager).contains("No matches"));
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Detail);
+        assert_eq!(manager.field_cursor, 1);
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_key(key(KeyCode::Tab), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section, ConfigSection::Zerocode);
+        assert!(manager.filter.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_filter_cancel_reopens_the_nested_page_it_started_from() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.screen = Screen::FieldList {
+            section_idx: 1,
+            prefix: "agents.alpha".into(),
+            breadcrumb: vec!["Agents".into(), "alpha".into()],
+        };
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("MCP").await;
+        assert_eq!(manager.loaded_section, Some(2));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.filter.is_none());
+        assert_eq!(manager.section_cursor, 1);
+        assert_eq!(manager.loaded_section, Some(1));
+        assert_eq!(manager.field_cursor, 1);
+        match &manager.screen {
+            Screen::FieldList {
+                prefix, breadcrumb, ..
+            } => {
+                assert_eq!(prefix, "agents.alpha");
+                assert_eq!(breadcrumb.len(), 2);
+            }
+            _ => panic!("cancel should reopen the agent page"),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_filter_cancel_keeps_the_costs_add_row_selected() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.sections[1] = entry_with_cost("Agents", "llm");
+        manager.screen = Screen::AliasList {
+            section_idx: 1,
+            map_path: "Agents.anthropic".into(),
+            breadcrumb: vec!["Agents".into(), "anthropic".into()],
+        };
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["first".into(), "second".into()];
+        manager.cost_cursor = 2;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager.handle_paste("MCP").await;
+        assert_eq!(manager.loaded_section, Some(2));
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.alias_tab, 1);
+        assert_eq!(manager.cost_resources.len(), 2);
+        assert_eq!(manager.cost_cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn config_filter_failed_paste_and_cancel_keep_tui_open_and_detail_inert() {
+        for fail_on_cancel in [false, true] {
+            let (mut manager, _) = responding_manager();
+            filter_fixture(&mut manager);
+            let mut term = filter_test_term();
+            manager
+                .handle_key(key(KeyCode::Char('/')), &mut term)
+                .await
+                .unwrap();
+            if fail_on_cancel {
+                manager.handle_paste("MCP").await;
+            }
+            manager.rpc = test_manager().rpc;
+            if fail_on_cancel {
+                manager
+                    .handle_key(key(KeyCode::Esc), &mut term)
+                    .await
+                    .unwrap();
+                assert_eq!(manager.section_cursor, 1);
+                assert_eq!(manager.loaded_section, Some(2));
+                assert!(manager.filter.is_none());
+            } else {
+                manager.handle_paste("MCP").await;
+                assert_eq!(manager.section_cursor, 2);
+                assert_eq!(manager.loaded_section, Some(1));
+            }
+            assert!(manager.status_msg.is_some());
+            let rendered = render_config_120(&mut manager);
+            assert!(!rendered.contains("first ="));
+            assert!(!rendered.contains("second ="));
+            assert_eq!(manager.last_main_area, Rect::default());
+            assert!(manager.last_tab_area.is_none());
+            manager
+                .handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                        column: 35,
+                        row: 10,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    Rect::new(0, 0, 120, 40),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            assert_eq!(manager.zeroclaw_pane, ZeroclawPane::Sections);
+            assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn config_filter_from_add_row_selects_a_real_alias_on_enter() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::AliasList {
+            section_idx: 1,
+            map_path: "agents".into(),
+            breadcrumb: vec!["agents".into()],
+        };
+        manager.aliases = vec!["first".into(), "second".into()];
+        manager.alias_cursor = 2;
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 1);
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&manager.screen, Screen::FieldList { prefix, .. } if prefix == "agents.second")
+        );
+        assert!(manager.filter.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_filter_sidebar_mouse_scroll_and_click_use_matching_rows() {
+        let (mut manager, _) = responding_manager();
+        filter_fixture(&mut manager);
+        let mut term = filter_test_term();
+        manager
+            .handle_key(key(KeyCode::Char('/')), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_key(key(KeyCode::Char('M')), &mut term)
+            .await
+            .unwrap();
+        render_config_120(&mut manager);
+        let area = manager.last_section_list_area;
+        manager
+            .handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: area.x + 2,
+                    row: area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 120, 40),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 1);
+        assert_eq!(manager.section_cursor, 2);
+        manager
+            .handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: area.x + 2,
+                    row: area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 120, 40),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.filter_cursor, 0);
+        assert_eq!(manager.section_cursor, 0);
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.section_cursor, 1);
     }
 
     fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
@@ -5252,6 +6392,137 @@ mod tests {
         }
     }
 
+    fn secret_map_field(path: &str) -> ConfigFieldEntry {
+        let mut f = field(path);
+        f.kind = PropKind::SecretMap;
+        f.is_secret = true;
+        f
+    }
+
+    /// Manager whose RPC is answered by a scripted fake daemon: every
+    /// outbound request is recorded and acknowledged (`config/list` gets an
+    /// empty entry list, everything else `{}`).
+    fn test_manager_with_recording_rpc() -> (App, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responder = Arc::clone(&outbound);
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(&frame) else {
+                    continue;
+                };
+                let id = req["id"].as_str().unwrap_or_default().to_string();
+                let result = if req["method"] == "config/list" {
+                    serde_json::json!({ "entries": [] })
+                } else {
+                    serde_json::json!({})
+                };
+                recorder.lock().unwrap().push(req);
+                responder.dispatch_response(&id, Some(result), None);
+            }
+        });
+        let rpc = Arc::new(RpcClient::with_rpc(outbound));
+        (App::new(rpc, std::path::Path::new("/tmp")), seen)
+    }
+
+    async fn type_text(manager: &mut App, text: &str) {
+        for c in text.chars() {
+            manager
+                .handle_field_edit(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn press_enter(manager: &mut App) {
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn secret_map_entry_kind_deserializes_from_daemon_wire_tag() {
+        let entry: ConfigFieldEntry = serde_json::from_value(serde_json::json!({
+            "path": "mcp.servers.acme.env",
+            "category": "Mcp",
+            "kind": "secret_map",
+            "type_hint": "HashMap<String,String>",
+            "populated": false,
+            "is_secret": true,
+            "description": "Optional environment variables for stdio transport.",
+        }))
+        .unwrap();
+        assert_eq!(entry.kind, PropKind::SecretMap);
+        assert_eq!(entry.kind.wire_name(), "secret_map");
+    }
+
+    #[test]
+    fn secret_map_key_validation_rejects_unusable_names() {
+        assert_eq!(
+            secret_map_key_validation_key(""),
+            Some("zc-config-secret-map-key-empty")
+        );
+        for bad in ["HAS SPACE", "A=B", "TAB\tKEY", "NL\nKEY"] {
+            assert_eq!(
+                secret_map_key_validation_key(bad),
+                Some("zc-config-secret-map-key-invalid"),
+                "{bad:?}"
+            );
+        }
+        for good in ["GITHUB_TOKEN", "Authorization", "X-Api-Key", "x.dotted"] {
+            assert_eq!(secret_map_key_validation_key(good), None, "{good:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_map_row_adds_entry_in_two_steps() {
+        let (mut manager, seen) = test_manager_with_recording_rpc();
+        manager.fields = vec![secret_map_field("mcp.servers.acme.env")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "mcp.servers.acme".into(),
+            breadcrumb: vec!["mcp.servers".into(), "acme".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+
+        // Step 1: an invalid key is refused without any RPC.
+        type_text(&mut manager, "BAD KEY").await;
+        press_enter(&mut manager).await;
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(manager.status_msg.is_some());
+        manager.edit_buf.clear();
+        manager.edit_cursor = 0;
+
+        type_text(&mut manager, "API_TOKEN").await;
+        press_enter(&mut manager).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(manager.edit_buf.is_empty(), "value step starts blank");
+
+        // Step 2: an empty value is refused (it would remove the entry).
+        press_enter(&mut manager).await;
+        assert_eq!(manager.secret_map_entry_key.as_deref(), Some("API_TOKEN"));
+        assert!(seen.lock().unwrap().is_empty(), "no RPC before a value");
+
+        type_text(&mut manager, "s3cr3t").await;
+        press_enter(&mut manager).await;
+
+        let requests = seen.lock().unwrap().clone();
+        let set = requests
+            .iter()
+            .find(|r| r["method"] == "config/set")
+            .expect("config/set must be sent");
+        assert_eq!(set["params"]["prop"], "mcp.servers.acme.env.API_TOKEN");
+        assert_eq!(set["params"]["value"], "s3cr3t");
+        assert!(manager.secret_map_entry_key.is_none());
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+    }
+
     #[tokio::test]
     async fn channels_type_list_reserves_a_global_settings_row() {
         let mut mgr = test_manager();
@@ -5323,6 +6594,12 @@ mod tests {
         ];
         mgr.type_cursor = 2;
         mgr.filter = Some("chan".to_string());
+        mgr.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Detail,
+            section_cursor: 0,
+            active_tab: 0,
+            detail: None,
+        });
         mgr.filter_cursor = 0;
 
         assert_eq!(mgr.selected_type_row(), Some(0));
@@ -5437,6 +6714,8 @@ mod tests {
                         req["params"]["value"].clone(),
                     ));
                     serde_json::json!({})
+                } else if method == crate::client::method::CONFIG_MAP_KEYS {
+                    serde_json::json!({ "keys": ["first", "second"] })
                 } else if method == crate::client::method::CONFIG_LIST {
                     let mut first = field("a.first");
                     first.tab = ConfigTab::Connection;

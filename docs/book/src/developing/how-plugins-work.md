@@ -37,7 +37,9 @@ one.
    the first and cheapest check.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
-   containing a `manifest.toml`.
+   containing a `manifest.toml`. It skips dot-prefixed directories, including
+   the hidden staging directory `zeroclaw plugin install` builds a package in
+   before renaming it into place, so a half-written install is never loaded.
 3. **Validate shape.** Each manifest must declare at least one capability, and
    a non-skill plugin must name a confined relative `wasm_path`. Traversal and
    symlink paths are rejected. A malformed manifest is skipped with a warning,
@@ -48,9 +50,17 @@ one.
 5. **Admit executable bytes.** The host opens the confined component once,
    verifies any declared `wasm_sha256`, and retains those exact bytes. In
    `strict` mode the signed manifest must declare this digest. Adapters compile
-   the admitted buffer rather than reopening its path. This is an execution
-   identity guarantee for the retained bytes, not a claim of race-free
-   filesystem namespace resolution.
+   the admitted buffer rather than reopening its path. On Unix the host opens
+   the package directory once and reaches the component from that handle one
+   path component at a time, never following a symlink, so moving or replacing
+   a directory during admission either fails it or leaves the read inside the
+   package that was confined. The component must be a regular file, and a FIFO
+   or device fails at once instead of blocking. The package directory and the
+   manifest are still found by pathname when admission starts; in `strict`
+   mode the signed `wasm_sha256` is what binds the manifest to the bytes. Other
+   platforms keep pathname checks, which refuse a replacement still in place
+   when they run but do not make the lookup atomic or keep a FIFO from blocking
+   the open.
 6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. A plugin whose package name or tool name
    conflicts with an already registered tool is refused with a warning instead
@@ -59,11 +69,93 @@ one.
    enumeration happens only when `[plugins] auto_discover = true` (default
    `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
    plugin tools or skills load, though channels you declare under
-   `[channels.plugin.<alias>]` still activate. The skill loader applies the same
-   `auto_discover` gate.
+   `[channels.plugin.<alias>]`, by hand or with `zeroclaw plugin bind`, still
+   activate. The skill loader applies the same `auto_discover` gate.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
+
+## Recovering legacy installations
+
+Run `zeroclaw plugin migrate` to relocate legacy package directories into
+`[plugins] plugins_dir`. Automatic recovery searches the configured data root's
+`plugins/`, the unsplit `<install>/workspace/plugins`, and the actual V2
+producer's `<install>/data/plugins` destination even if the data field differs.
+New V2 filesystem splits move plugins to host data, so fresh and resumed splits
+stay reachable without using
+the default agent's live writable workspace as a recovery source. Host data is
+not necessarily the configured runtime plugins directory; `plugin migrate`
+performs that later relocation. The configured target and canonical aliases of
+it are excluded, and duplicate roots are reported once.
+
+Supported aliases of these legacy roots are followed. Canonical target aliases
+are excluded and aliases of the same root are deduplicated. A root overlapping
+a known agent workspace is excluded whether it lies inside that workspace or
+contains it, including aliases. Known roles come from each configured agent's
+actual workspace path, the implicit default, and the historical default
+workspace. Existing paths are compared canonically; absent declared workspaces
+are conservatively compared as normalized lexical paths, resolving an existing
+ancestor alias when available. Selection does not create a missing workspace
+or treat the declared path as evidence of old migration.
+
+This is root selection: the existing mover still rescans an eligible root with
+its own package checks. Both the recovery hint and mover require an ordinary
+child package directory, matching runtime discovery. Child directory symlinks
+stay at the source; they are neither moved nor materialized, even in a root
+with ordinary packages. A manifest alias inside an ordinary package directory
+still uses the existing manifest-loading and admission checks.
+
+This does not create a global no-follow guarantee, an authenticated snapshot,
+or a new concurrent no-clobber contract. Its existing
+same-name destination check leaves colliding packages at the source for
+operator resolution and retry.
+
+The directory-migration helper does not edit plugin configuration, grants,
+publisher trust or enablement. Config loading before the command retains its
+normal initialization and migration effects. Moving packages makes them
+eligible for normal discovery: tool and skill plugins may become available
+when plugins are enabled and `auto_discover = true`, subject to admission.
+Relocation itself neither verifies ABI compatibility nor authenticates origin.
+
+### Packages already split into an agent workspace
+
+Earlier versions could move packages to
+`<install>/agents/default/workspace/plugins`. That historical location and a
+custom live agent workspace are no longer automatic sources for
+`plugin migrate`. A manifest, matching backup name, or caller-written marker
+does not authorize directory-wide adoption. Inspect each package you intend to
+adopt, then select its individual directory with the existing install command:
+
+```sh
+zeroclaw --config-dir '/operator/install' plugin install \
+  '/operator/install/agents/default/workspace/plugins/package-name'
+```
+
+Use your actual install and package paths; do not pass the entire `plugins/`
+directory. A package in a backup can likewise be selected explicitly by its
+actual path. The operator's install action supplies the authority, not the
+path's apparent history. This requires a build with plugin CLI support.
+
+This is a fresh installation of a compatible package. The host applies the
+current manifest, signature, payload and config-schema rules, and the CLI
+load-checks executable packages against its WIT ABI and limits by default.
+Unsigned/untrusted packages under strict policy, incomplete old manifests,
+incompatible components, or unsupported legacy config rows may be refused;
+follow the diagnostic and [typed-config migration guidance](../plugins/migrating-to-typed-config.md)
+before retrying. No historical-format conversion or signing-policy bypass is
+provided. Existing same-name installed packages are refused rather than
+silently replaced.
+
+Explicit install retains the source directory. It writes the admitted manifest
+and executable payload and copies declared skill content; arbitrary auxiliary
+files are not a full-directory recovery contract, and skill copying is not an
+immutable generation snapshot. For tool bindings needing host-owned state,
+install can create missing typed config rows and seed declared HTTP egress
+destinations into new rows. Existing rows and grants are not automatically
+extended, and old package-name rows are not silently converted. Review these
+installation effects and configure required values before enabling runtime
+use. Explicit adoption is therefore separate from the automatic migration
+helper's unchanged-config/grant behavior.
 
 ## Signature policy
 
@@ -104,16 +196,19 @@ one twice:
    only by instantiating the component to read its metadata. A plugin whose
    tool name matches an already registered tool is not registered. The host
    logs a `WARN` event with `error_key` `plugin_tool_name_conflict` in its
-   `attributes`.
+   `attributes`. A tool name that contains `__` is refused even when nothing
+   holds it yet, because MCP tools are named `<server>__<tool>` and register
+   after plugin tools. That refusal carries `error_key`
+   `plugin_tool_name_reserved`.
 
 The names checked are the tools that registry build has already registered,
 including plugin tools accepted earlier in the same pass, plus
 `execute_pipeline` when `[pipeline] enabled = true`. This is not a fixed list
 of every built-in name: a built-in that a build does not register, for example
-because its config section is disabled, is not reserved in that build. Tools
-that join the registry after plugin registration are outside this check. Give
-plugin packages and tools names that are unique outright rather than relying
-on it.
+because its config section is disabled, is not reserved in that build. Apart
+from the MCP namespace, tools that join the registry after plugin registration
+are outside this check. Give plugin packages and tools names that are unique
+outright rather than relying on it.
 
 ## Capabilities and permissions
 
@@ -164,6 +259,17 @@ it is `false` by default, so `enabled = true` alone activates only the channels
 you declare under `[channels.plugin.<alias>]` and no plugin tools or skills. A
 host that runs only plugins you build yourself can leave `signature_mode` at its
 `disabled` default during development and tighten it before the host is shared.
+
+A channel binding lives outside `plugins.*`, under `[channels.plugin.<alias>]`.
+You can write that table by hand, or let `zeroclaw plugin bind <package>
+--channel-alias <alias>` write it for an installed channel package. The command
+also seeds the instance's `[[plugins.entries]]` row, requires an explicit
+`--egress declared` or `--egress none` flag before it creates that row from a
+manifest that declares destinations and holds a transport that can reach them
+(`http_client`, `websocket_client`, or `socket_client`), and reports what the
+instance still needs before it can start. It never sets `plugins.enabled` and
+never edits an agent's `channels`. See
+[Binding a channel instance](../plugins/index.md#binding-a-channel-instance).
 
 ## What a plugin still cannot do
 
