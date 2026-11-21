@@ -44,6 +44,12 @@ struct PendingApproval {
 /// deliberately small and bounded — it is a race window, not a history.
 const RETIRED_APPROVAL_TOKENS: usize = 64;
 
+/// How many inbound post IDs to remember. A redelivered post arrives within
+/// seconds of the original — a reconnect replay or a server-side ghost — so
+/// this is a race window, not a delivery history, and it is bounded like the
+/// retired-token ring.
+const SEEN_POST_IDS: usize = 1024;
+
 /// All approval bookkeeping, behind one lock.
 ///
 /// The two maps and the retired-token ring are a single unit of state because
@@ -132,6 +138,42 @@ impl ApprovalState {
 
     fn was_retired(&self, token: &str) -> bool {
         self.retired.iter().any(|seen| seen == token)
+    }
+}
+
+/// Bounded FIFO of recently-admitted inbound post IDs, behind one lock.
+///
+/// The WebSocket listener has no equivalent of the polling cursor
+/// (`create_at <= last_create_at`), so a redelivered `posted` event — reconnect
+/// replay, server-side duplicate — would otherwise be forwarded to the model
+/// as a fresh message, and the operator watches the agent answer the same
+/// instruction twice. This set is the single identity gate both listeners pass
+/// through, enforced at admission rather than per-listener so neither mode can
+/// drift from it.
+///
+/// A scanned ring, the same shape as [`ApprovalState::remember_retired`]:
+/// admission is event-driven and the window is small, so a linear lookup costs
+/// less than a second collection that has to be kept in step with the first.
+#[derive(Default)]
+struct SeenPosts {
+    ids: std::collections::VecDeque<String>,
+}
+
+impl SeenPosts {
+    /// Record `id` and return whether this delivery was the first sighting.
+    ///
+    /// Check-and-record is one critical section at the call site (the guard
+    /// is held across both steps), so the deliveries of a duplicate are
+    /// decided by arrival order, never by a race between the two checks.
+    fn admit(&mut self, id: &str) -> bool {
+        if self.ids.iter().any(|seen| seen == id) {
+            return false;
+        }
+        if self.ids.len() == SEEN_POST_IDS {
+            self.ids.pop_front();
+        }
+        self.ids.push_back(id.to_string());
+        true
     }
 }
 
@@ -368,6 +410,8 @@ pub struct MattermostChannel {
     /// re-runs on `DISCOVERY_REFRESH`, so an edited purpose reaches the prompt
     /// within that window rather than needing a restart.
     room_purposes: Arc<Mutex<HashMap<String, String>>>,
+    /// Recently-admitted inbound post IDs — see [`SeenPosts`].
+    seen_posts: Mutex<SeenPosts>,
 }
 
 impl MattermostChannel {
@@ -411,6 +455,7 @@ impl MattermostChannel {
                 .approval_timeout_secs,
             purpose_as_instructions: false,
             room_purposes: Arc::new(Mutex::new(HashMap::new())),
+            seen_posts: Mutex::new(SeenPosts::default()),
         }
     }
 
@@ -1715,6 +1760,27 @@ impl MattermostChannel {
         is_direct: bool,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> bool {
+        // Post-id dedup gate. Runs ahead of every side effect — transcription,
+        // approval consumption, the model path — so a ghost delivery is dropped
+        // rather than half-processed. An empty id has no identity to dedup on
+        // and passes through; the downstream checks still apply to it.
+        let post_id = post
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if !post_id.is_empty() && !self.seen_posts.lock().admit(post_id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_attrs(::serde_json::json!({
+                        "alias": self.alias,
+                        "post_id": post_id,
+                    })),
+                "suppressing duplicate Mattermost post delivery"
+            );
+            return false;
+        }
+
         let effective_text = if post
             .get("message")
             .and_then(|message| message.as_str())
@@ -4849,9 +4915,13 @@ mod approval_tests {
             "approval-reply text must not fall through to the model either"
         );
 
-        // The same reply in the origin channel resolves it.
+        // The same reply in the origin channel resolves it. Distinct post id:
+        // in production two posts in two rooms never share one, and the
+        // inbound dedup gate now treats the id as post identity.
+        let mut origin_reply = post_from(ALLOWED_USER, "abc123 yes");
+        origin_reply["id"] = json!("post2");
         ch.process_inbound_post(
-            &post_from(ALLOWED_USER, "abc123 yes"),
+            &origin_reply,
             "bot_user_id",
             "glados",
             0,
@@ -6454,5 +6524,169 @@ mod channel_purpose_freshness_tests {
             "data": {"channel": json!({"purpose": "no id"}).to_string()}
         }));
         assert!(ch.room_purposes.lock().is_empty());
+    }
+}
+
+/// Post-id dedup on the inbound admission path.
+///
+/// A duplicate `posted` delivery surfaces to the operator as the agent
+/// answering the same instruction twice, and the WebSocket listener had no
+/// identity check at all (the polling cursor only filters by `create_at`).
+/// These tests pin the gate where both listeners actually pass through:
+/// `process_inbound_post`.
+#[cfg(test)]
+mod inbound_dedup_tests {
+    use super::*;
+    use serde_json::json;
+
+    const BOT_USER: &str = "bot_user_id";
+    const OPERATOR: &str = "operator_user_id";
+    const CHANNEL: &str = "chan1";
+
+    fn channel() -> MattermostChannel {
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "dedup_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        );
+        let _ = ch
+            .bot_identity
+            .set((BOT_USER.to_string(), "glados".to_string()));
+        ch
+    }
+
+    fn post(id: &str, message: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "user_id": OPERATOR,
+            "message": message,
+            "create_at": 10,
+            "channel_id": CHANNEL,
+        })
+    }
+
+    #[tokio::test]
+    async fn same_post_id_delivered_twice_reaches_the_model_once() {
+        let ch = channel();
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        ch.process_inbound_post(
+            &post("dup", "do the thing"),
+            BOT_USER,
+            "glados",
+            0,
+            CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+        // The ghost delivery: byte-identical event, same post id.
+        ch.process_inbound_post(
+            &post("dup", "do the thing"),
+            BOT_USER,
+            "glados",
+            0,
+            CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        let message = inbound
+            .try_recv()
+            .expect("the first delivery must reach the model");
+        assert_eq!(message.content, "do the thing");
+        assert!(
+            inbound.try_recv().is_err(),
+            "the duplicate delivery must be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_post_ids_are_both_admitted() {
+        let ch = channel();
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+
+        ch.process_inbound_post(
+            &post("first", "one"),
+            BOT_USER,
+            "glados",
+            0,
+            CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+        ch.process_inbound_post(
+            &post("second", "two"),
+            BOT_USER,
+            "glados",
+            0,
+            CHANNEL,
+            false,
+            &tx,
+        )
+        .await;
+
+        assert_eq!(inbound.try_recv().unwrap().content, "one");
+        assert_eq!(
+            inbound.try_recv().unwrap().content,
+            "two",
+            "a different post must never be suppressed as a duplicate of another"
+        );
+    }
+
+    #[tokio::test]
+    async fn posts_without_an_id_are_not_deduped_against_each_other() {
+        let ch = channel();
+        let (tx, mut inbound) = tokio::sync::mpsc::channel(8);
+        let anonymous = json!({
+            "id": "",
+            "user_id": OPERATOR,
+            "message": "no identity",
+            "create_at": 10,
+            "channel_id": CHANNEL,
+        });
+
+        ch.process_inbound_post(&anonymous, BOT_USER, "glados", 0, CHANNEL, false, &tx)
+            .await;
+        ch.process_inbound_post(&anonymous, BOT_USER, "glados", 0, CHANNEL, false, &tx)
+            .await;
+
+        assert!(
+            inbound.try_recv().is_ok(),
+            "an id-less post has no identity to suppress on"
+        );
+        assert!(
+            inbound.try_recv().is_ok(),
+            "a second id-less post must not be suppressed either"
+        );
+    }
+
+    #[test]
+    fn seen_posts_ring_is_bounded_and_evicts_oldest() {
+        let mut seen = SeenPosts::default();
+        for i in 0..SEEN_POST_IDS {
+            assert!(seen.admit(&format!("post-{i}")), "id {i} is new");
+        }
+        assert!(
+            !seen.admit("post-0"),
+            "an id inside the window is a duplicate"
+        );
+        assert!(
+            seen.admit("fresh"),
+            "the window grows only by evicting its oldest entry"
+        );
+        assert!(
+            seen.admit("post-0"),
+            "an evicted id is forgotten: a race window, not a delivery history"
+        );
+        assert_eq!(seen.ids.len(), SEEN_POST_IDS);
     }
 }
